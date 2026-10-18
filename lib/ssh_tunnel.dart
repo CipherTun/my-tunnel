@@ -247,6 +247,8 @@ class TunnelSocket implements SSHSocket {
   @override
   Future<void> get done => _socket.done;
   @override
+  Future<void> flush() => _socket.flush();
+  @override
   Future<void> close() async => _socket.close();
   @override
   void destroy() => _socket.destroy();

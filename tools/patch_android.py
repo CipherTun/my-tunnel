@@ -23,7 +23,4 @@ for f in glob.glob("android/app/build.gradle*"):
     t = re.sub(r"minSdkVersion\s+[^\n]+", f"minSdkVersion {MIN_SDK}", t)
     open(f, "w", encoding="utf-8").write(t)
 
-# 16 KB page-size friendly packaging for the native cores
-with open("android/gradle.properties", "a", encoding="utf-8") as g:
-    g.write("\nandroid.bundle.enableUncompressedNativeLibs=false\n")
 print("android patched")

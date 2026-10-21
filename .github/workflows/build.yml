@@ -42,33 +42,54 @@ jobs:
         run: flutter analyze
       - name: Run tests
         run: flutter test
-      - name: Build release APK for ARM32, ARM64 and x86_64
-        run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
-      - name: Verify APK ABI payload
+      - name: Build separate release APKs
         run: |
-          APK=build/app/outputs/flutter-apk/app-release.apk
-          test -s "$APK"
-          echo "Native libraries packaged in release APK:"
-          unzip -l "$APK" | grep -E 'lib/(armeabi-v7a|arm64-v8a|x86_64)/' || true
-          for ABI in armeabi-v7a arm64-v8a x86_64; do
-            if ! unzip -l "$APK" | grep -q "lib/$ABI/"; then
-              echo "ERROR: Release APK is missing native libraries for $ABI"
-              exit 1
-            fi
-          done
-      - name: Verify package identity and APK
+          flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64,android-x64
+
+      - name: Verify each split APK and package identity
         run: |
-          test -s build/app/outputs/flutter-apk/app-release.apk
+          set -eu
+          OUT="build/app/outputs/flutter-apk"
           AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -n 1)"
-          if [ -z "$AAPT" ]; then
-            echo "ERROR: Android SDK aapt was not found; cannot verify package metadata."
-            exit 1
-          fi
-          "$AAPT" dump badging build/app/outputs/flutter-apk/app-release.apk | grep -F "package: name='xyz.xray.vpn'"
-          "$AAPT" dump badging build/app/outputs/flutter-apk/app-release.apk | grep -F "application-label:'XRay Vpn'"
-      - uses: actions/upload-artifact@v4
+          test -n "$AAPT" || { echo "ERROR: aapt not found"; exit 1; }
+
+          verify_apk() {
+            APK="$1"
+            ABI="$2"
+            test -s "$APK" || { echo "ERROR: Missing APK: $APK"; exit 1; }
+            unzip -l "$APK" | grep -q "lib/$ABI/" || {
+              echo "ERROR: $APK does not contain native libraries for $ABI"
+              exit 1
+            }
+            "$AAPT" dump badging "$APK" | grep -F "package: name='xyz.xray.vpn'"
+            "$AAPT" dump badging "$APK" | grep -F "application-label:'XRay Vpn'"
+            echo "Verified: $APK ($ABI)"
+          }
+
+          verify_apk "$OUT/app-armeabi-v7a-release.apk" "armeabi-v7a"
+          verify_apk "$OUT/app-arm64-v8a-release.apk" "arm64-v8a"
+          verify_apk "$OUT/app-x86_64-release.apk" "x86_64"
+
+      - name: Upload ARM32 APK
+        uses: actions/upload-artifact@v4
         with:
-          name: xray-vpn-universal-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: xray-vpn-armeabi-v7a
+          path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload ARM64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-arm64-v8a
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload x86_64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-x86_64
+          path: build/app/outputs/flutter-apk/app-x86_64-release.apk
           if-no-files-found: error
           retention-days: 14

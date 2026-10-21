@@ -1,31 +1,75 @@
-name: Build APK
+name: XRay Vpn Android Build
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xray-vpn-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   android:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-      - run: flutter --version
-      # Generate android/ so it doesn't need to be committed
-      - run: flutter create --platforms=android --org com.example --project-name vpn_app .
-      - run: python3 tools/patch_android.py
-      - run: flutter pub get
-      # One universal APK containing every ABI Flutter can build:
-      # armeabi-v7a (32-bit ARM), arm64-v8a, x86_64
-      - run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
+      - name: Toolchain versions
+        run: |
+          flutter --version
+          dart --version
+          java -version
+      # xyz.xray + project name vpn generates namespace/applicationId xyz.xray.vpn.
+      - name: Generate Android host project
+        run: flutter create --platforms=android --org xyz.xray --project-name vpn .
+      - name: Configure Android VPN host
+        run: python3 tools/patch_android.py
+      - name: Resolve dependencies
+        run: flutter pub get
+      - name: Analyze Dart source
+        run: flutter analyze
+      - name: Run tests
+        run: flutter test
+      - name: Build release APK for ARM32, ARM64 and x86_64
+        run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
+      - name: Verify APK ABI payload
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          test -s "$APK"
+          echo "Native libraries packaged in release APK:"
+          unzip -l "$APK" | grep -E 'lib/(armeabi-v7a|arm64-v8a|x86_64)/' || true
+          for ABI in armeabi-v7a arm64-v8a x86_64; do
+            if ! unzip -l "$APK" | grep -q "lib/$ABI/"; then
+              echo "ERROR: Release APK is missing native libraries for $ABI"
+              exit 1
+            fi
+          done
+      - name: Verify package identity and APK
+        run: |
+          test -s build/app/outputs/flutter-apk/app-release.apk
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$AAPT" ]; then
+            echo "ERROR: Android SDK aapt was not found; cannot verify package metadata."
+            exit 1
+          fi
+          "$AAPT" dump badging build/app/outputs/flutter-apk/app-release.apk | grep -F "package: name='xyz.xray.vpn'"
+          "$AAPT" dump badging build/app/outputs/flutter-apk/app-release.apk | grep -F "application-label:'XRay Vpn'"
       - uses: actions/upload-artifact@v4
         with:
-          name: my-tunnel-universal-apk
+          name: xray-vpn-universal-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14

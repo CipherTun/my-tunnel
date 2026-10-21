@@ -3,10 +3,12 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_v2ray_client/flutter_v2ray.dart';
+import 'package:flutter_singbox_client/flutter_singbox_client.dart';
 
 import 'core_config.dart';
 import 'models.dart';
 import 'ssh_tunnel.dart';
+import 'singbox_config.dart';
 
 enum ConnState { disconnected, connecting, connected }
 
@@ -24,6 +26,8 @@ class VpnController extends ChangeNotifier {
   Completer<void>? _up;
   final SshTunnel _ssh = SshTunnel();
   late final V2ray _v2 = V2ray(onStatusChanged: _onV2);
+  final SingboxClient _singbox = SingboxClient();
+  StreamSubscription<dynamic>? _singboxStateSub;
 
   Profile? get selected {
     for (final p in profiles) {
@@ -52,7 +56,25 @@ class VpnController extends ChangeNotifier {
         notificationIconResourceName: 'ic_launcher',
       );
     } catch (e) {
-      log('Core init failed: $e');
+      log('Xray core init failed: $e');
+    }
+    try {
+      await _singbox.initialize();
+      _singboxStateSub ??= _singbox.serviceStateStream.listen((dynamic event) {
+        final value = event.toString().toLowerCase();
+        if ((value.contains('stopped') || value.contains('disconnected') || value.contains('failed')) &&
+            state == ConnState.connected && !_userStopped) {
+          // Move out of CONNECTED before stopping so the stop event cannot
+          // recursively trigger another drop handler.
+          state = ConnState.connecting;
+          _dropped();
+        }
+      }, onError: (Object error) {
+        log('sing-box status stream error: $error');
+      });
+      log('Independent sing-box engine initialized');
+    } catch (e) {
+      log('sing-box core init failed: $e');
     }
     notifyListeners();
   }
@@ -68,6 +90,12 @@ class VpnController extends ChangeNotifier {
   }
 
   Future<void> remove(String id) async {
+    // Do not leave a running tunnel attached to a profile that was deleted.
+    final active = _root;
+    if (state != ConnState.disconnected &&
+        (active?.id == id || active?.members.contains(id) == true)) {
+      await disconnect();
+    }
     profiles.removeWhere((e) => e.id == id);
     for (final g in profiles.where((e) => e.type == ProfileType.group)) {
       (g.data['members'] as List?)?.remove(id);
@@ -79,6 +107,9 @@ class VpnController extends ChangeNotifier {
   }
 
   Future<void> select(String id) async {
+    if (!profiles.any((p) => p.id == id)) {
+      throw ArgumentError.value(id, 'id', 'Profile does not exist');
+    }
     selectedId = id;
     await Store.saveSelected(id);
     notifyListeners();
@@ -200,9 +231,17 @@ class VpnController extends ChangeNotifier {
     try {
       await _v2.stopV2Ray();
     } catch (_) {}
+    try {
+      await _singbox.disconnect();
+    } catch (_) {}
   }
 
   Future<void> _start(Profile p) async {
+    // SSH payload mode retains the existing SSH transport and routes its local
+    // SOCKS listener through Xray. Standard links can use either independent core.
+    if (settings.coreEngine == 'singbox' && p.type != ProfileType.ssh) {
+      return _launchSingbox(p);
+    }
     switch (p.type) {
       case ProfileType.ssh:
         return _startSsh(p);
@@ -213,6 +252,32 @@ class VpnController extends ChangeNotifier {
       case ProfileType.group:
         throw 'Nested groups are not supported';
     }
+  }
+
+  Future<void> _launchSingbox(Profile p) async {
+    state = ConnState.connecting;
+    notifyListeners();
+    final config = buildSingboxConfig(p, settings);
+    if (!await _singbox.requestVPNPermission()) throw 'VPN permission denied';
+    await _singbox.checkConfig(config);
+    await _singbox.connect(SessionOptions(
+      config: config,
+      networkMode: NetworkMode.vpn,
+      notification: NotificationConfig(
+        title: 'XRay Vpn',
+        showTrafficStats: true,
+        showStopButton: true,
+        stopButtonLabel: 'Disconnect',
+      ),
+    ));
+    if (_userStopped) {
+      await _singbox.disconnect();
+      return;
+    }
+    state = ConnState.connected;
+    _retries = 0;
+    log('sing-box tunnel started: ${p.name}');
+    notifyListeners();
   }
 
   Future<void> _startSsh(Profile p) async {
@@ -231,8 +296,12 @@ class VpnController extends ChangeNotifier {
       wsFraming: p.b('ws'),
       keepAlive: settings.sshKeepalive,
       shareHotspot: settings.shareHotspot,
+      shareUsername: settings.shareUsername,
+      sharePassword: settings.sharePassword,
     );
     if (opts.host.isEmpty || opts.user.isEmpty) throw 'Host and username are required';
+    validatePort(opts.port, 'SSH port');
+    if (opts.proxyHost.isNotEmpty) validatePort(opts.proxyPort, 'Proxy port');
 
     _ssh.onClosed = () {
       if (!_userStopped && state == ConnState.connected) _dropped();
@@ -254,5 +323,12 @@ class VpnController extends ChangeNotifier {
     );
     await _up!.future.timeout(const Duration(seconds: 25),
         onTimeout: () => throw 'Tunnel did not come up within 25s');
+  }
+
+  @override
+  void dispose() {
+    _retryTimer?.cancel();
+    _singboxStateSub?.cancel();
+    super.dispose();
   }
 }

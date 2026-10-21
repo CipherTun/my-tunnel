@@ -18,6 +18,8 @@ class _SettingsPageState extends State<SettingsPage> {
   late final _fb = TextEditingController(text: s.fallbackDns);
   late final _port = TextEditingController(text: '${s.socksPort}');
   late final _ka = TextEditingController(text: '${s.sshKeepalive}');
+  late final _shareUser = TextEditingController(text: s.shareUsername);
+  late final _sharePass = TextEditingController(text: s.sharePassword);
   late final _max = TextEditingController(text: '${s.reconnectMax}');
 
   static const _quick = {
@@ -34,6 +36,12 @@ class _SettingsPageState extends State<SettingsPage> {
       InputDecoration(border: const OutlineInputBorder(), labelText: l, hintText: h);
 
   Future<void> _save() async {
+    if (s.shareHotspot && (_shareUser.text.trim().isEmpty || _sharePass.text.isEmpty)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Set a proxy username and password before enabling LAN sharing.')),
+      );
+      return;
+    }
     s
       ..dns1 = _dns1.text
       ..dns2 = _dns2.text
@@ -41,7 +49,9 @@ class _SettingsPageState extends State<SettingsPage> {
       ..bypassApps = _apps.text
       ..socksPort = int.tryParse(_port.text) ?? 10808
       ..sshKeepalive = int.tryParse(_ka.text) ?? 20
-      ..reconnectMax = int.tryParse(_max.text) ?? 5;
+      ..reconnectMax = int.tryParse(_max.text) ?? 5
+      ..shareUsername = _shareUser.text.trim()
+      ..sharePassword = _sharePass.text;
     await widget.ctrl.saveSettings(s);
     if (mounted) Navigator.pop(context);
   }
@@ -84,6 +94,20 @@ class _SettingsPageState extends State<SettingsPage> {
             child: Text('SSH mode always resolves DNS over TCP.',
                 style: TextStyle(fontSize: 12)),
           ),
+          _h('VPN engine'),
+          DropdownButtonFormField<String>(
+            initialValue: s.coreEngine,
+            decoration: _dec('Core engine'),
+            items: const [
+              DropdownMenuItem(value: 'xray', child: Text('Xray-core (existing engine)')),
+              DropdownMenuItem(value: 'singbox', child: Text('sing-box (independent engine)')),
+            ],
+            onChanged: (v) => setState(() => s.coreEngine = v ?? 'xray'),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 6),
+            child: Text('sing-box supports standard compatible links and sing-box JSON. Custom SSH payload profiles continue to use the existing Xray SOCKS bridge. Unsupported link transports fail validation instead of silently falling back.', style: TextStyle(fontSize: 12)),
+          ),
           _h('Connection'),
           SwitchListTile(
               contentPadding: EdgeInsets.zero,
@@ -112,10 +136,20 @@ class _SettingsPageState extends State<SettingsPage> {
               decoration: _dec('Keep-alive interval (seconds)')),
           SwitchListTile(
               contentPadding: EdgeInsets.zero,
-              title: const Text('Share connection over hotspot'),
-              subtitle: const Text('Opens the SOCKS5 port on 0.0.0.0 without a password. Trusted networks only.'),
+              title: const Text('Expose SSH SOCKS proxy to LAN'),
+              subtitle: const Text('Exposes an authenticated SOCKS5 proxy to devices on your hotspot/LAN. Clients must enter the proxy address, port, username and password. SSH profiles only; this is not transparent routing for every app.'),
               value: s.shareHotspot,
               onChanged: (v) => setState(() => s.shareHotspot = v)),
+          if (s.shareHotspot) ...[
+            const SizedBox(height: 10),
+            TextField(controller: _shareUser, autocorrect: false, decoration: _dec('Proxy username')),
+            const SizedBox(height: 10),
+            TextField(controller: _sharePass, obscureText: true, autocorrect: false, decoration: _dec('Proxy password')),
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text('Use a strong, unique password. Saved locally on this phone. Share only with trusted devices.', style: TextStyle(fontSize: 12)),
+            ),
+          ],
           _h('Apps that bypass the VPN'),
           Wrap(spacing: 8, runSpacing: 4, children: [
             for (final e in _quick.entries)

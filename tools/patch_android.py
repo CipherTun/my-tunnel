@@ -1,83 +1,102 @@
-"""Patches the generated android/ folder (run after `flutter create`)."""
-import glob
+"""Idempotent Android host configuration for XRay Vpn."""
+from pathlib import Path
 import re
 
-MIN_SDK = "23"
+PACKAGE = "xyz.xray.vpn"
+APP_LABEL = "XRay Vpn"
+MIN_SDK = 23
 
-# Keep required permissions, but let Gradle control native-library packaging.
-mf = "android/app/src/main/AndroidManifest.xml"
-with open(mf, encoding="utf-8") as f:
-    s = f.read()
+manifest = Path("android/app/src/main/AndroidManifest.xml")
+if not manifest.is_file():
+    raise SystemExit(f"ERROR: Android manifest not found: {manifest}")
+text = manifest.read_text(encoding="utf-8")
 
-# Remove the manifest attribute rejected by the current Android Gradle Plugin.
-s = re.sub(
-    r'\s+android:extractNativeLibs="(?:true|false)"',
-    "",
-    s,
+text, count = re.subn(
+    r'android:label="[^"]*"',
+    f'android:label="{APP_LABEL}"',
+    text,
+    count=1,
 )
+if count != 1:
+    raise SystemExit("ERROR: Could not find android:label in generated manifest.")
 
-perms = ""
-for perm in (
-    "INTERNET",
-    "FOREGROUND_SERVICE",
-    "POST_NOTIFICATIONS",
-    "CHANGE_NETWORK_STATE",
+for permission in (
+    "android.permission.INTERNET",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.CHANGE_NETWORK_STATE",
 ):
-    tag = f"android.permission.{perm}"
-    if tag not in s:
-        perms += f'    <uses-permission android:name="{tag}"/>\n'
+    if f'android:name="{permission}"' not in text:
+        match = re.search(r"<application\b", text)
+        if not match:
+            raise SystemExit("ERROR: <application> tag not found in manifest.")
+        text = text[:match.start()] + f'    <uses-permission android:name="{permission}"/>\n' + text[match.start():]
+manifest.write_text(text, encoding="utf-8")
 
-if perms:
-    match = re.search(r"(?m)^([ \t]*)<application\b", s)
-    if not match:
-        raise SystemExit("ERROR: <application> tag not found.")
-    s = s[:match.start()] + perms + s[match.start():]
-
-with open(mf, "w", encoding="utf-8") as f:
-    f.write(s)
-
-# Set minimum SDK and configure native-library packaging through Gradle.
-files = glob.glob("android/app/build.gradle*")
-if not files:
+gradle_files = [
+    p for p in (Path("android/app/build.gradle"), Path("android/app/build.gradle.kts"))
+    if p.is_file()
+]
+if not gradle_files:
     raise SystemExit("ERROR: No Android app Gradle build file found.")
 
-for path in files:
-    with open(path, encoding="utf-8") as f:
-        t = f.read()
+for path in gradle_files:
+    gradle = path.read_text(encoding="utf-8")
+    kotlin = path.suffix == ".kts"
 
-    t = re.sub(r"minSdk\s*=\s*[^\n]+", f"minSdk = {MIN_SDK}", t)
-    t = re.sub(r"minSdkVersion\s+[^\n]+", f"minSdkVersion {MIN_SDK}", t)
+    ns_pattern = r'namespace\s*=\s*"[^"]*"'
+    if re.search(ns_pattern, gradle):
+        gradle = re.sub(ns_pattern, f'namespace = "{PACKAGE}"', gradle, count=1)
+    else:
+        namespace_line = f'    namespace = "{PACKAGE}"' if kotlin else f"    namespace '{PACKAGE}'"
+        gradle, count = re.subn(r"(?m)^android\s*\{", lambda m: m.group(0) + "\n" + namespace_line, gradle, count=1)
+        if count != 1:
+            raise SystemExit(f"ERROR: Cannot set namespace in {path}")
 
-    if "useLegacyPackaging" not in t:
-        if path.endswith(".kts"):
-            block = (
-                "\n    packagingOptions {\n"
+    app_pattern = r'applicationId\s*=\s*"[^"]*"'
+    if re.search(app_pattern, gradle):
+        gradle = re.sub(app_pattern, f'applicationId = "{PACKAGE}"', gradle, count=1)
+    else:
+        app_line = f'        applicationId = "{PACKAGE}"' if kotlin else f"        applicationId '{PACKAGE}'"
+        gradle, count = re.subn(r"defaultConfig\s*\{", lambda m: m.group(0) + "\n" + app_line, gradle, count=1)
+        if count != 1:
+            raise SystemExit(f"ERROR: Cannot set applicationId in {path}")
+
+    if kotlin:
+        gradle = re.sub(r"minSdk\s*=\s*[^\n]+", f"minSdk = {MIN_SDK}", gradle)
+        if not re.search(r"minSdk\s*=", gradle):
+            gradle, count = re.subn(r"defaultConfig\s*\{", lambda m: m.group(0) + f"\n        minSdk = {MIN_SDK}", gradle, count=1)
+            if count != 1:
+                raise SystemExit(f"ERROR: Cannot set minSdk in {path}")
+        if "useLegacyPackaging" not in gradle:
+            packaging = (
+                "\n    packaging {\n"
                 "        jniLibs {\n"
                 "            useLegacyPackaging = true\n"
                 "        }\n"
                 "    }\n"
             )
-        else:
-            block = (
+            gradle, count = re.subn(r"(?m)^android\s*\{", lambda m: m.group(0) + packaging, gradle, count=1)
+            if count != 1:
+                raise SystemExit(f"ERROR: Cannot configure native library packaging in {path}")
+    else:
+        gradle = re.sub(r"minSdkVersion\s+[^\n]+", f"minSdkVersion {MIN_SDK}", gradle)
+        if "minSdkVersion" not in gradle:
+            gradle, count = re.subn(r"defaultConfig\s*\{", lambda m: m.group(0) + f"\n        minSdkVersion {MIN_SDK}", gradle, count=1)
+            if count != 1:
+                raise SystemExit(f"ERROR: Cannot set minSdkVersion in {path}")
+        if "useLegacyPackaging" not in gradle:
+            packaging = (
                 "\n    packagingOptions {\n"
                 "        jniLibs {\n"
                 "            useLegacyPackaging true\n"
                 "        }\n"
                 "    }\n"
             )
+            gradle, count = re.subn(r"(?m)^android\s*\{", lambda m: m.group(0) + packaging, gradle, count=1)
+            if count != 1:
+                raise SystemExit(f"ERROR: Cannot configure native library packaging in {path}")
 
-        t, count = re.subn(
-            r"(?m)^android\s*\{",
-            lambda m: m.group(0) + block,
-            t,
-            count=1,
-        )
-        if count != 1:
-            raise SystemExit(
-                f"ERROR: Could not locate android {{ in {path}."
-            )
+    path.write_text(gradle, encoding="utf-8")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(t)
-
-print("Android patch completed.")
+print(f"Android host configured: {PACKAGE} ({APP_LABEL}), minSdk {MIN_SDK}.")

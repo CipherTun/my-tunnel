@@ -15,7 +15,7 @@ class VpnApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'My Tunnel',
+        title: 'XRay Vpn',
         theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
         darkTheme: ThemeData(
             colorSchemeSeed: Colors.indigo,
@@ -159,7 +159,7 @@ class _HomePageState extends State<HomePage> {
         final locked = ctrl.state != ConnState.disconnected;
         return Scaffold(
           appBar: AppBar(
-            title: const Text('My Tunnel'),
+            title: const Text('XRay Vpn'),
             actions: [
               IconButton(
                   icon: const Icon(Icons.build_outlined),

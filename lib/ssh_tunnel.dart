@@ -8,6 +8,13 @@ import 'package:dartssh2/dartssh2.dart';
 
 typedef Log = void Function(String message);
 
+/// Validates TCP/UDP port fields before they reach socket APIs.
+void validatePort(int port, String label) {
+  if (port < 1 || port > 65535) {
+    throw '$label must be between 1 and 65535';
+  }
+}
+
 final Random _rng = Random.secure();
 int _rotateCounter = 0;
 
@@ -30,6 +37,8 @@ class SshOptions {
     this.wsFraming = false,
     this.keepAlive = 20,
     this.shareHotspot = false,
+    this.shareUsername = '',
+    this.sharePassword = '',
   });
 
   final String host;
@@ -46,6 +55,8 @@ class SshOptions {
   final bool wsFraming;
   final int keepAlive;
   final bool shareHotspot;
+  final String shareUsername;
+  final String sharePassword;
 }
 
 /// [random=a,b,c] picks one at random, [rotate=a,b,c] advances per connection.
@@ -284,8 +295,11 @@ class _FramedSink implements StreamSink<List<int>> {
 }
 
 Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
-  final useProxy = o.proxyHost.isNotEmpty;
-  final firstHost = useProxy ? o.proxyHost : o.host;
+  if (o.host.trim().isEmpty) throw 'SSH host is required';
+  validatePort(o.port, 'SSH port');
+  final useProxy = o.proxyHost.trim().isNotEmpty;
+  if (useProxy) validatePort(o.proxyPort, 'Proxy port');
+  final firstHost = useProxy ? o.proxyHost.trim() : o.host.trim();
   final firstPort = useProxy ? o.proxyPort : o.port;
 
   log('Connecting to $firstHost:$firstPort${useProxy ? ' (proxy)' : ''}');
@@ -294,9 +308,19 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
   sock.setOption(SocketOption.tcpNoDelay, true);
 
   if (o.useTls) {
-    final sni = expandRandomRotate(o.sni.isNotEmpty ? o.sni : o.host);
+    final sni = expandRandomRotate(o.sni.isNotEmpty ? o.sni : o.host).trim();
+    if (sni.isEmpty) {
+      sock.destroy();
+      throw 'TLS SNI/host name is empty';
+    }
     log('TLS handshake (SNI: $sni)');
-    sock = await SecureSocket.secure(sock, host: sni, onBadCertificate: (_) => true);
+    try {
+      // Keep Dart's normal certificate and hostname verification enabled.
+      sock = await SecureSocket.secure(sock, host: sni);
+    } catch (_) {
+      sock.destroy();
+      rethrow;
+    }
   }
 
   var template = o.payload.trim();
@@ -328,13 +352,16 @@ Future<String> hostCheck({
   String payload = '',
 }) async {
   final sw = Stopwatch()..start();
+  Socket? s;
   try {
-    Socket s = await Socket.connect(host, port, timeout: const Duration(seconds: 8));
+    if (host.trim().isEmpty) throw 'Host is required';
+    validatePort(port, 'Target port');
+    s = await Socket.connect(host.trim(), port, timeout: const Duration(seconds: 8));
     final tcp = sw.elapsedMilliseconds;
     var tlsMs = 0;
     final name = expandRandomRotate(sni.isEmpty ? host : sni);
     if (tls) {
-      s = await SecureSocket.secure(s, host: name, onBadCertificate: (_) => true);
+      s = await SecureSocket.secure(s, host: name);
       tlsMs = sw.elapsedMilliseconds - tcp;
     }
     final body = payload.trim().isEmpty
@@ -346,6 +373,7 @@ Future<String> hostCheck({
     final line = latin1.decode(first, allowInvalid: true).split('\r\n').first;
     return 'TCP ${tcp}ms${tls ? '  ·  TLS ${tlsMs}ms' : ''}\nReply: $line';
   } catch (e) {
+    s?.destroy();
     return 'Failed: $e';
   }
 }
@@ -410,17 +438,21 @@ class _Reader {
 }
 
 class LocalSocks {
-  LocalSocks(this._client, this._log, {this.bindAll = false});
+  LocalSocks(this._client, this._log, {this.bindAll = false, this.username = '', this.password = ''});
   final SSHClient _client;
   final Log _log;
   final bool bindAll;
+  final String username;
+  final String password;
+  bool get requireAuth => bindAll;
   ServerSocket? _server;
 
   Future<void> start(int port) async {
+    validatePort(port, 'Local SOCKS5 port');
     _server = await ServerSocket.bind(
         bindAll ? InternetAddress.anyIPv4 : InternetAddress.loopbackIPv4, port);
     _server!.listen(_handle);
-    _log('SOCKS5 listening on ${bindAll ? '0.0.0.0' : '127.0.0.1'}:$port');
+    _log('SOCKS5 listening on ${bindAll ? '0.0.0.0' : '127.0.0.1'}:$port${requireAuth ? ' (username/password required)' : ''}');
   }
 
   Future<void> stop() async {
@@ -432,9 +464,37 @@ class LocalSocks {
     final r = _Reader(s);
     try {
       final g = await r.read(2);
-      if (g[0] != 5) throw 'not socks5';
-      await r.read(g[1]);
-      s.add([5, 0]);
+      if (g[0] != 5 || g[1] < 1 || g[1] > 32) throw 'invalid SOCKS5 greeting';
+      final methods = await r.read(g[1]);
+      final method = requireAuth ? 2 : 0;
+      if (!methods.contains(method)) {
+        s.add([5, 255]);
+        await s.close();
+        return;
+      }
+      s.add([5, method]);
+      if (requireAuth) {
+        final auth = await r.read(2);
+        if (auth[0] != 1 || auth[1] < 1 || auth[1] > 255) {
+          s.add([1, 1]);
+          await s.close();
+          return;
+        }
+        final user = utf8.decode(await r.read(auth[1]), allowMalformed: true);
+        final passLen = (await r.read(1))[0];
+        if (passLen < 1) {
+          s.add([1, 1]);
+          await s.close();
+          return;
+        }
+        final pass = utf8.decode(await r.read(passLen), allowMalformed: true);
+        final ok = user == username && pass == password;
+        s.add([1, ok ? 0 : 1]);
+        if (!ok) {
+          await s.close();
+          return;
+        }
+      }
 
       final h = await r.read(4);
       if (h[1] != 1) {
@@ -493,6 +553,20 @@ class SshTunnel {
   void Function()? onClosed;
 
   Future<int> start(SshOptions o, Log log, {int socksPort = 10808}) async {
+    validatePort(socksPort, 'Local SOCKS5 port');
+    if (o.user.trim().isEmpty) throw 'SSH username is required';
+    if (o.keepAlive < 0 || o.keepAlive > 3600) {
+      throw 'SSH keep-alive must be between 0 and 3600 seconds';
+    }
+    if (o.shareHotspot) {
+      if (o.shareUsername.trim().isEmpty || o.sharePassword.isEmpty) {
+        throw 'LAN sharing requires a non-empty username and password';
+      }
+      if (utf8.encode(o.shareUsername).length > 255 ||
+          utf8.encode(o.sharePassword).length > 255) {
+        throw 'Proxy username and password must be at most 255 UTF-8 bytes';
+      }
+    }
     final sock = await openTransport(o, log);
     log('SSH handshake + auth as ${o.user}');
     List<SSHKeyPair>? ids;
@@ -518,7 +592,13 @@ class SshTunnel {
       onClosed?.call();
     });
 
-    _socks = LocalSocks(client, log, bindAll: o.shareHotspot);
+    _socks = LocalSocks(
+      client,
+      log,
+      bindAll: o.shareHotspot,
+      username: o.shareUsername,
+      password: o.sharePassword,
+    );
     await _socks!.start(socksPort);
     return socksPort;
   }

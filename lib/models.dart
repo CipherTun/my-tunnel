@@ -118,6 +118,7 @@ Profile? importProfile(String raw) {
 
 class AppSettings {
   String dnsPreset = 'default'; // default|google|cloudflare|quad9|adguard|custom
+  String coreEngine = 'xray'; // xray|singbox; sing-box is used for supported standard links/configs
   String dns1 = '';
   String dns2 = '';
   String fallbackDns = '';
@@ -126,6 +127,8 @@ class AppSettings {
   bool bypassLan = false;
   String bypassApps = '';
   bool shareHotspot = false;
+  String shareUsername = '';
+  String sharePassword = '';
   int socksPort = 10808;
   int sshKeepalive = 20;
 
@@ -149,6 +152,7 @@ class AppSettings {
 
   Map<String, dynamic> toJson() => {
         'dnsPreset': dnsPreset,
+        'coreEngine': coreEngine,
         'dns1': dns1,
         'dns2': dns2,
         'fallbackDns': fallbackDns,
@@ -157,22 +161,27 @@ class AppSettings {
         'bypassLan': bypassLan,
         'bypassApps': bypassApps,
         'shareHotspot': shareHotspot,
+        'shareUsername': shareUsername,
+        'sharePassword': sharePassword,
         'socksPort': socksPort,
         'sshKeepalive': sshKeepalive,
       };
 
   static AppSettings fromJson(Map<String, dynamic> j) => AppSettings()
     ..dnsPreset = j['dnsPreset'] ?? 'default'
+    ..coreEngine = (j['coreEngine'] == 'singbox' ? 'singbox' : 'xray')
     ..dns1 = j['dns1'] ?? ''
     ..dns2 = j['dns2'] ?? ''
     ..fallbackDns = j['fallbackDns'] ?? ''
     ..autoReconnect = j['autoReconnect'] ?? true
-    ..reconnectMax = j['reconnectMax'] ?? 5
+    ..reconnectMax = ((j['reconnectMax'] as num?)?.toInt() ?? 5).clamp(0, 20).toInt()
     ..bypassLan = j['bypassLan'] ?? false
     ..bypassApps = j['bypassApps'] ?? ''
     ..shareHotspot = j['shareHotspot'] ?? false
-    ..socksPort = j['socksPort'] ?? 10808
-    ..sshKeepalive = j['sshKeepalive'] ?? 20;
+    ..shareUsername = j['shareUsername'] ?? ''
+    ..sharePassword = j['sharePassword'] ?? ''
+    ..socksPort = ((j['socksPort'] as num?)?.toInt() ?? 10808).clamp(1, 65535).toInt()
+    ..sshKeepalive = ((j['sshKeepalive'] as num?)?.toInt() ?? 20).clamp(0, 3600).toInt();
 }
 
 class Store {

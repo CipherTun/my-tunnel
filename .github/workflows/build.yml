@@ -34,6 +34,11 @@ jobs:
       # xyz.xray + project name vpn generates namespace/applicationId xyz.xray.vpn.
       - name: Generate Android host project
         run: flutter create --platforms=android --org xyz.xray --project-name vpn .
+
+      - name: Remove generated placeholder test and lint config
+        run: |
+          rm -f test/widget_test.dart analysis_options.yaml
+          test -s test/core_regression_test.dart
       - name: Configure Android VPN host
         run: python3 tools/patch_android.py
       - name: Resolve dependencies

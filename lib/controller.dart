@@ -231,9 +231,9 @@ class VpnController extends ChangeNotifier {
       case ProfileType.ssh:
         return _startSsh(p);
       case ProfileType.v2ray:
-        return _launch(p.name, buildXrayConfig(p, settings));
+        return _launch(p.name, await buildXrayConfig(p, settings, _box));
       case ProfileType.wireguard:
-        return _launch(p.name, buildWireguardConfig(p.s('config'), settings));
+        return _launch(p.name, await buildWireguardConfig(p.s('config'), settings, _box));
       case ProfileType.group:
         throw 'Nested groups are not supported';
     }
@@ -289,7 +289,7 @@ class VpnController extends ChangeNotifier {
       if (!_userStopped && state == ConnState.connected) _dropped();
     };
     final port = await _ssh.start(opts, log, socksPort: settings.socksPort);
-    await _launch(p.name, buildSocksConfig(port, settings));
+    await _launch(p.name, await buildSocksConfig(port, settings, _box));
   }
 
   Future<void> _launch(String remark, String config) async {

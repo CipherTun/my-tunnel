@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'package:flutter_v2ray_client/flutter_v2ray.dart';
+import 'package:v2ray_box/v2ray_box.dart';
 import 'models.dart';
 
 /// Everything except private/LAN ranges (so LAN traffic bypasses the tunnel).
@@ -169,11 +169,12 @@ Map<String, dynamic> wgToOutbound(String conf) {
   };
 }
 
-String _template() =>
-    V2ray.parseFromURL('socks://127.0.0.1:1080#tpl').getFullConfiguration();
+Future<String> _template(V2rayBox box) =>
+    box.generateConfig('socks://127.0.0.1:1080#tpl');
 
-String _withOutbound(Map<String, dynamic> outbound) {
-  final m = jsonDecode(_template()) as Map<String, dynamic>;
+Future<String> _withOutbound(
+    Map<String, dynamic> outbound, V2rayBox box) async {
+  final m = jsonDecode(await _template(box)) as Map<String, dynamic>;
   final outs = (m['outbounds'] as List).cast<Map<String, dynamic>>();
   var idx = outs.indexWhere((o) => o['tag'] == 'proxy');
   if (idx < 0) idx = 0;
@@ -203,7 +204,8 @@ String patchDns(String cfg, AppSettings s, {bool tcpOnly = false}) {
   }
 }
 
-String buildXrayConfig(Profile p, AppSettings s) {
+Future<String> buildXrayConfig(
+    Profile p, AppSettings s, V2rayBox box) async {
   switch (p.s('mode')) {
     case 'json':
       final raw = p.s('json').trim();
@@ -215,17 +217,19 @@ String buildXrayConfig(Profile p, AppSettings s) {
       return raw;
     case 'link':
       return patchDns(
-          V2ray.parseFromURL(p.s('link').trim()).getFullConfiguration(), s);
+          await box.generateConfig(p.s('link').trim()), s);
     default:
-      return patchDns(
-          V2ray.parseFromURL(buildShareLink(p.data, p.name)).getFullConfiguration(), s);
+      final link = buildShareLink(p.data, p.name);
+      return patchDns(await box.generateConfig(link), s);
   }
 }
 
-String buildWireguardConfig(String conf, AppSettings s) =>
-    patchDns(_withOutbound(wgToOutbound(conf)), s);
+Future<String> buildWireguardConfig(
+        String conf, AppSettings s, V2rayBox box) async =>
+    patchDns(await _withOutbound(wgToOutbound(conf), box), s);
 
-String buildSocksConfig(int port, AppSettings s) {
-  final cfg = V2ray.parseFromURL('socks://127.0.0.1:$port#SSH').getFullConfiguration();
+Future<String> buildSocksConfig(
+    int port, AppSettings s, V2rayBox box) async {
+  final cfg = await box.generateConfig('socks://127.0.0.1:$port#SSH');
   return patchDns(cfg, s, tcpOnly: true);
 }

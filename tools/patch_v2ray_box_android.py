@@ -25,11 +25,13 @@ permissions = [
 ]
 for perm in permissions:
     if f'android:name="{perm}"' not in s:
-        s = re.sub(
-            r'(?m)^',
-            f'    <uses-permission android:name="{perm}" />\n',
-            s,
-            count=1
+        match = re.search(r"<application\b", s)
+        if not match:
+            raise SystemExit("ERROR: Cannot find manifest application tag.")
+        s = (
+            s[:match.start()]
+            + f'    <uses-permission android:name="{perm}" />\n'
+            + s[match.start():]
         )
 
 s = re.sub(
@@ -79,10 +81,21 @@ if "multiDexEnabled" not in g:
     if n != 1:
         raise SystemExit("Could not add multidex setting")
 if 'fileTree(mapOf("dir" to "libs"' not in g and "fileTree(dir: 'libs'" not in g:
-    dep = ('implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar")))'
-           if kts else "implementation fileTree(dir: 'libs', include: ['*.aar'])")
-    g, n = re.subn(r'dependencies\s*\{', lambda m: m.group(0) + "\n    " + dep, g, count=1)
-    if n != 1:
-        raise SystemExit("Could not add local AAR dependency")
+    dep = (
+        'implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))'
+        if kts else
+        "implementation fileTree(dir: 'libs', include: ['*.aar'])"
+    )
+    if re.search(r'\bdependencies\s*\{', g):
+        g, n = re.subn(
+            r'\bdependencies\s*\{',
+            lambda m: m.group(0) + "\n    " + dep,
+            g,
+            count=1
+        )
+        if n != 1:
+            raise SystemExit("ERROR: Could not update Gradle dependencies.")
+    else:
+        g += "\n\ndependencies {\n    " + dep + "\n}\n"
 gradle.write_text(g)
 print("Configured v2ray_box Android services and local AAR loading.")

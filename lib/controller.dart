@@ -2,8 +2,7 @@ import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter_v2ray_client/flutter_v2ray.dart';
-import 'package:flutter_singbox_client/flutter_singbox_client.dart';
+import 'package:v2ray_box/v2ray_box.dart';
 
 import 'core_config.dart';
 import 'models.dart';
@@ -25,9 +24,8 @@ class VpnController extends ChangeNotifier {
   Timer? _retryTimer;
   Completer<void>? _up;
   final SshTunnel _ssh = SshTunnel();
-  late final V2ray _v2 = V2ray(onStatusChanged: _onV2);
-  final SingboxClient _singbox = SingboxClient();
-  StreamSubscription<dynamic>? _singboxStateSub;
+  final V2rayBox _box = V2rayBox();
+  StreamSubscription<VpnStatus>? _boxStateSub;
 
   Profile? get selected {
     for (final p in profiles) {
@@ -51,30 +49,18 @@ class VpnController extends ChangeNotifier {
     selectedId = await Store.loadSelected() ??
         (profiles.isNotEmpty ? profiles.first.id : null);
     try {
-      await _v2.initialize(
-        notificationIconResourceType: 'mipmap',
-        notificationIconResourceName: 'ic_launcher',
+      await _box.initialize(
+        notificationStopButtonText: 'Disconnect',
+        notificationIconName: 'ic_launcher',
       );
+      await _box.setServiceMode(VpnMode.vpn);
+      _boxStateSub ??= _box.watchStatus().listen(
+        _onBoxStatus,
+        onError: (Object error) => log('VPN status stream error: $error'),
+      );
+      log('Unified Xray/sing-box engine initialized');
     } catch (e) {
-      log('Xray core init failed: $e');
-    }
-    try {
-      await _singbox.initialize();
-      _singboxStateSub ??= _singbox.serviceStateStream.listen((dynamic event) {
-        final value = event.toString().toLowerCase();
-        if ((value.contains('stopped') || value.contains('disconnected') || value.contains('failed')) &&
-            state == ConnState.connected && !_userStopped) {
-          // Move out of CONNECTED before stopping so the stop event cannot
-          // recursively trigger another drop handler.
-          state = ConnState.connecting;
-          _dropped();
-        }
-      }, onError: (Object error) {
-        log('sing-box status stream error: $error');
-      });
-      log('Independent sing-box engine initialized');
-    } catch (e) {
-      log('sing-box core init failed: $e');
+      log('VPN core initialization failed: $e');
     }
     notifyListeners();
   }
@@ -122,21 +108,23 @@ class VpnController extends ChangeNotifier {
   }
 
   // ---------- core status ----------
-  void _onV2(V2RayStatus st) {
+  void _onBoxStatus(VpnStatus status) {
     if (_root == null) return;
-    switch (st.state.toString().toUpperCase()) {
-      case 'CONNECTED':
+    final value = status.toString().split('.').last.toLowerCase();
+    switch (value) {
+      case 'started':
         state = ConnState.connected;
         _retries = 0;
         final u = _up;
         if (u != null && !u.isCompleted) u.complete();
         log('Tunnel up');
         break;
-      case 'CONNECTING':
+      case 'starting':
         if (state != ConnState.connected) state = ConnState.connecting;
         break;
-      case 'DISCONNECTED':
+      case 'stopped':
         if (state == ConnState.connected && !_userStopped) {
+          state = ConnState.connecting;
           _dropped();
           return;
         }
@@ -229,10 +217,7 @@ class VpnController extends ChangeNotifier {
       await _ssh.stop();
     } catch (_) {}
     try {
-      await _v2.stopV2Ray();
-    } catch (_) {}
-    try {
-      await _singbox.disconnect();
+      await _box.disconnect();
     } catch (_) {}
   }
 
@@ -258,20 +243,17 @@ class VpnController extends ChangeNotifier {
     state = ConnState.connecting;
     notifyListeners();
     final config = buildSingboxConfig(p, settings);
-    if (!await _singbox.requestVPNPermission()) throw 'VPN permission denied';
-    await _singbox.checkConfig(config);
-    await _singbox.connect(SessionOptions(
-      config: config,
-      networkMode: NetworkMode.vpn,
-      notification: NotificationConfig(
-        title: 'XRay Vpn',
-        showTrafficStats: true,
-        showStopButton: true,
-        stopButtonLabel: 'Disconnect',
-      ),
-    ));
+    if (!await _box.requestVpnPermission()) {
+      throw 'VPN permission denied';
+    }
+    await _box.setServiceMode(VpnMode.vpn);
+    if (!await _box.setCoreEngine('singbox')) {
+      throw 'Could not select sing-box engine';
+    }
+    final started = await _box.connectWithJson(config, name: p.name);
+    if (!started) throw 'sing-box refused the configuration';
     if (_userStopped) {
-      await _singbox.disconnect();
+      await _box.disconnect();
       return;
     }
     state = ConnState.connected;
@@ -312,23 +294,30 @@ class VpnController extends ChangeNotifier {
 
   Future<void> _launch(String remark, String config) async {
     _up = Completer<void>();
-    if (!await _v2.requestPermission()) throw 'VPN permission denied';
+    if (!await _box.requestVpnPermission()) {
+      throw 'VPN permission denied';
+    }
+    await _box.setServiceMode(VpnMode.vpn);
+    if (!await _box.setCoreEngine('xray')) {
+      throw 'Could not select Xray engine';
+    }
     final apps = settings.blockedApps;
-    await _v2.startV2Ray(
-      remark: remark,
-      config: config,
-      blockedApps: apps.isEmpty ? null : apps,
-      bypassSubnets: settings.bypassLan ? lanBypassSubnets : null,
-      proxyOnly: false,
+    if (apps.isNotEmpty) {
+      await _box.setPerAppProxyMode(PerAppProxyMode.exclude);
+      await _box.setPerAppProxyList(apps, PerAppProxyMode.exclude);
+    }
+    final started = await _box.connectWithJson(config, name: remark);
+    if (!started) throw 'Xray refused the configuration';
+    await _up!.future.timeout(
+      const Duration(seconds: 25),
+      onTimeout: () => throw 'Tunnel did not come up within 25s',
     );
-    await _up!.future.timeout(const Duration(seconds: 25),
-        onTimeout: () => throw 'Tunnel did not come up within 25s');
   }
 
   @override
   void dispose() {
     _retryTimer?.cancel();
-    _singboxStateSub?.cancel();
+    _boxStateSub?.cancel();
     super.dispose();
   }
 }

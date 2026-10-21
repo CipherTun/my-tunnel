@@ -105,6 +105,8 @@ package libXray
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -115,7 +117,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/xtls/libxray/nodep"
 	corenet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
@@ -132,13 +133,28 @@ func SetTunFd(fd int) {
 	_ = os.Setenv(platform.NormalizeEnvName(platform.TunFdKey), value)
 }
 
+func encodeDelayResponse(delay int64, err error) string {
+	type response struct {
+		Success bool   `json:"success"`
+		Data    any    `json:"data"`
+		Error   string `json:"error,omitempty"`
+	}
+	result := response{Success: err == nil}
+	if err != nil {
+		result.Error = err.Error()
+	} else {
+		result.Data = delay
+	}
+	raw, marshalErr := json.Marshal(result)
+	if marshalErr != nil {
+		raw = []byte("{\"success\":false,\"data\":null,\"error\":\"encoding failed\"}")
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
 // MeasureOutboundDelay uses core.Dial (v2rayNG style real ping) instead of local SOCKS ping.
-// Returns base64 encoded CallResponse just like other libXray wrapper APIs.
 func MeasureOutboundDelay(configJSON string, url string, timeoutSec int64) string {
-	var response nodep.CallResponse[int64]
-
 	if strings.TrimSpace(configJSON) == "" {
-		return response.EncodeToBase64(nodep.PingDelayError, fmt.Errorf("empty config JSON"))
+		return encodeDelayResponse(10000, fmt.Errorf("empty config JSON"))
 	}
 
 	if strings.TrimSpace(url) == "" {
@@ -154,12 +170,12 @@ func MeasureOutboundDelay(configJSON string, url string, timeoutSec int64) strin
 
 	inst, err := core.StartInstance("json", []byte(configJSON))
 	if err != nil {
-		return response.EncodeToBase64(nodep.PingDelayError, err)
+		return encodeDelayResponse(10000, err)
 	}
 	defer inst.Close()
 
 	delay, err := measureDelayByCoreDial(inst, url, time.Duration(timeoutSec)*time.Second)
-	return response.EncodeToBase64(delay, err)
+	return encodeDelayResponse(delay, err)
 }
 
 func measureDelayByCoreDial(inst *core.Instance, url string, timeout time.Duration) (int64, error) {
@@ -193,7 +209,7 @@ func measureDelayByCoreDial(inst *core.Instance, url string, timeout time.Durati
 			if success {
 				return minDuration, nil
 			}
-			return nodep.PingDelayTimeout, err
+			return 11000, err
 		}
 
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -235,11 +251,11 @@ func measureDelayByCoreDial(inst *core.Instance, url string, timeout time.Durati
 	}
 	if lastErr != nil {
 		if errors.Is(lastErr, context.DeadlineExceeded) || errors.Is(lastErr, context.Canceled) {
-			return nodep.PingDelayTimeout, lastErr
+			return 11000, lastErr
 		}
-		return nodep.PingDelayError, lastErr
+		return 10000, lastErr
 	}
-	return nodep.PingDelayError, fmt.Errorf("delay test failed")
+	return 10000, fmt.Errorf("delay test failed")
 }
 EOF
   log "Injected Android compatibility APIs into libXray source: ${patch_file}"

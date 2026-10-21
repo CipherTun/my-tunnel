@@ -10,7 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   v2ray_box: ^1.0.6
-      dartssh2: ^2.9.0
+  dartssh2: ^2.9.0
   shared_preferences: ^2.2.3
 
 dev_dependencies:

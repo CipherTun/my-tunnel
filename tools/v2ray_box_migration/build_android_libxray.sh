@@ -118,7 +118,6 @@ import (
 	"time"
 
 	corenet "github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 )
 
@@ -129,8 +128,8 @@ func SetTunFd(fd int) {
 		fd = 0
 	}
 	value := strconv.Itoa(fd)
-	_ = os.Setenv(platform.TunFdKey, value)
-	_ = os.Setenv(platform.NormalizeEnvName(platform.TunFdKey), value)
+	_ = os.Setenv("xray.tun.fd", value)
+	_ = os.Setenv("XRAY_TUN_FD", value)
 }
 
 func encodeDelayResponse(delay int64, err error) string {

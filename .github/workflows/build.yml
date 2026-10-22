@@ -45,33 +45,45 @@ jobs:
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Build APK
-        run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
+        run: flutter build apk --release --split-per-abi
 
-      - name: Sign APK
+      - name: Sign split APKs
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          IN=build/app/outputs/flutter-apk/app-release.apk
-          OUT=dist/XRayVpn-release.apk
-          if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
-            echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.p12"
-            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-            ARGS=(sign --ks "$RUNNER_TEMP/release.p12" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD)
-            if [ -n "$KEY_PASSWORD" ]; then ARGS+=(--key-pass env:KEY_PASSWORD); fi
-            "$BT/apksigner" "${ARGS[@]}" --out "$OUT" "$IN"
-            "$BT/apksigner" verify --print-certs "$OUT" | head -3
-            rm -f "$RUNNER_TEMP/release.p12"
-          else
-            echo "::warning::No signing secrets set. The APK is debug-signed with a throwaway key, so each build has a different signature and cannot update the previous install."
-            cp "$IN" "$OUT"
+          BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          shopt -s nullglob
+          APKS=(build/app/outputs/flutter-apk/app-*-release.apk)
+
+          if [ "${#APKS[@]}" -ne 3 ]; then
+            echo "::error::Expected three ABI-split release APKs; found ${#APKS[@]}."
+            ls -la build/app/outputs/flutter-apk/ || true
+            exit 1
           fi
+
+          for IN in "${APKS[@]}"; do
+            OUT="dist/XRayVpn-${IN##*/app-}"
+            if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
+              echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.p12"
+              ARGS=(sign --ks "$RUNNER_TEMP/release.p12" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD)
+              if [ -n "$KEY_PASSWORD" ]; then ARGS+=(--key-pass env:KEY_PASSWORD); fi
+              "$BT/apksigner" "${ARGS[@]}" --out "$OUT" "$IN"
+              "$BT/apksigner" verify "$OUT"
+              rm -f "$RUNNER_TEMP/release.p12"
+            else
+              echo "::warning::Signing secrets are incomplete; copying the build-produced APK without release-key signing."
+              cp "$IN" "$OUT"
+            fi
+            echo "Prepared: $OUT"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: XRayVpn-apk
+          name: XRayVpn-split-apks
           path: dist/*.apk
           if-no-files-found: error

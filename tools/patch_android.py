@@ -136,13 +136,15 @@ def patch_gradle():
 
     gp = os.path.join(ROOT, "android", "gradle.properties")
     g = read(gp) if os.path.exists(gp) else ""
-    for line in (
-        "android.useAndroidX=true",
-        "android.bundle.enableUncompressedNativeLibs=false",
-    ):
-        key = line.split("=")[0]
-        if key not in g:
-            g += ("\n" if g and not g.endswith("\n") else "") + line + "\n"
+    # AGP 8.1+ removed android.bundle.enableUncompressedNativeLibs.
+    # Native library packaging is configured through useLegacyPackaging above.
+    g = re.sub(
+        r"(?m)^\\s*android\\.bundle\\.enableUncompressedNativeLibs\\s*=.*(?:\\n|$)",
+        "",
+        g,
+    )
+    if not re.search(r"(?m)^\\s*android\\.useAndroidX\\s*=\\s*true\\s*$", g):
+        g += ("\\n" if g and not g.endswith("\\n") else "") + "android.useAndroidX=true\\n"
     write(gp, g)
 
 

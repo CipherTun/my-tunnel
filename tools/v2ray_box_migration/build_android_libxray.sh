@@ -4,7 +4,7 @@ set -euo pipefail
 LIBXRAY_REPO_URL="https://github.com/XTLS/libXray.git"
 # Prefer the libXray default development branch so xray-core updates in libXray
 # commits (for example v26.2.6) are picked up immediately.
-LIBXRAY_REF="main"
+LIBXRAY_REF="v25.12.8"
 PROJECT_ROOT="$(pwd)"
 LIBXRAY_DIR=""
 KEEP_SOURCE=false

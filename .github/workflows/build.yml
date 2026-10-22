@@ -2,7 +2,8 @@ name: Build XRay Vpn
 
 on:
   push:
-    branches: [main, master, dev]
+    branches:
+      - test/xray-vpn-zip-as-is
   workflow_dispatch:
 
 permissions:

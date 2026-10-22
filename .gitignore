@@ -2,6 +2,10 @@
 build/
 android/
 ios/
+test/
 .flutter-plugins*
 .packages
 pubspec.lock
+*.jks
+*.p12
+key.properties

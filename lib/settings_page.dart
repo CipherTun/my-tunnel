@@ -1,175 +1,217 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
+import 'apps_page.dart';
+import 'app_info.dart';
 import 'controller.dart';
-import 'models.dart';
+import 'native.dart';
+import 'theme.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key, required this.ctrl});
   final VpnController ctrl;
+
   @override
   State<SettingsPage> createState() => _SettingsPageState();
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  late final AppSettings s = AppSettings.fromJson(widget.ctrl.settings.toJson());
-  late final _apps = TextEditingController(text: s.bypassApps);
-  late final _dns1 = TextEditingController(text: s.dns1);
-  late final _dns2 = TextEditingController(text: s.dns2);
-  late final _fb = TextEditingController(text: s.fallbackDns);
-  late final _port = TextEditingController(text: '${s.socksPort}');
-  late final _ka = TextEditingController(text: '${s.sshKeepalive}');
-  late final _shareUser = TextEditingController(text: s.shareUsername);
-  late final _sharePass = TextEditingController(text: s.sharePassword);
-  late final _max = TextEditingController(text: '${s.reconnectMax}');
-
-  static const _quick = {
-    'WhatsApp': 'com.whatsapp',
-    'YouTube': 'com.google.android.youtube',
-    'Telegram': 'org.telegram.messenger',
-    'Chrome': 'com.android.chrome',
-    'Instagram': 'com.instagram.android',
-    'Facebook': 'com.facebook.katana',
-    'TikTok': 'com.zhiliaoapp.musically',
-  };
-
-  InputDecoration _dec(String l, [String? h]) =>
-      InputDecoration(border: const OutlineInputBorder(), labelText: l, hintText: h);
-
-  Future<void> _save() async {
-    if (s.shareHotspot && (_shareUser.text.trim().isEmpty || _sharePass.text.isEmpty)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Set a proxy username and password before enabling LAN sharing.')),
-      );
-      return;
-    }
-    s
-      ..dns1 = _dns1.text
-      ..dns2 = _dns2.text
-      ..fallbackDns = _fb.text
-      ..bypassApps = _apps.text
-      ..socksPort = int.tryParse(_port.text) ?? 10808
-      ..sshKeepalive = int.tryParse(_ka.text) ?? 20
-      ..reconnectMax = int.tryParse(_max.text) ?? 5
-      ..shareUsername = _shareUser.text.trim()
-      ..sharePassword = _sharePass.text;
-    await widget.ctrl.saveSettings(s);
-    if (mounted) Navigator.pop(context);
-  }
+  VpnController get c => widget.ctrl;
 
   Widget _h(String t) => Padding(
-      padding: const EdgeInsets.only(top: 20, bottom: 8),
-      child: Text(t, style: Theme.of(context).textTheme.titleMedium));
+        padding: const EdgeInsets.fromLTRB(16, 20, 16, 6),
+        child: Text(t, style: TextStyle(fontWeight: FontWeight.w700, color: Theme.of(context).colorScheme.primary)),
+      );
+
+  Widget _sw(String t, String sub, bool v, void Function(bool) f) => SwitchListTile(
+        title: Text(t),
+        subtitle: Text(sub, style: const TextStyle(fontSize: 12)),
+        value: v,
+        onChanged: (x) {
+          setState(() => f(x));
+          c.saveSettings();
+        },
+      );
+
+  Widget _num(String label, int value, int min, int max, void Function(int) f, {String? help}) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        child: TextFormField(
+          initialValue: '$value',
+          keyboardType: TextInputType.number,
+          decoration: InputDecoration(labelText: label, helperText: help ?? '$min - $max'),
+          onChanged: (v) {
+            final n = int.tryParse(v);
+            if (n != null && n >= min && n <= max) {
+              f(n);
+              c.saveSettings();
+            }
+          },
+        ),
+      );
+
+  Widget _text(String label, String value, void Function(String) f, {String? hint}) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+        child: TextFormField(
+          initialValue: value,
+          autocorrect: false,
+          decoration: InputDecoration(labelText: label, hintText: hint),
+          onChanged: (v) {
+            f(v.trim());
+            c.saveSettings();
+          },
+        ),
+      );
+
+  Future<void> _pickApps() async {
+    final r = await Navigator.of(context).push<Set<String>>(
+      MaterialPageRoute(builder: (_) => AppsPage(selected: c.settings.blockedApps.toSet())),
+    );
+    if (r != null) {
+      setState(() => c.settings.bypassApps = (r.toList()..sort()).join('\n'));
+      await c.saveSettings();
+    }
+  }
+
+  Future<void> _import() async {
+    final t = TextEditingController();
+    final d = await Clipboard.getData(Clipboard.kTextPlain);
+    if ((d?.text ?? '').contains('"profiles"')) t.text = d!.text!;
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Import backup'),
+        content: TextField(controller: t, maxLines: 8, decoration: const InputDecoration(hintText: 'Paste backup JSON')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Import')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      final n = await c.importBackup(t.text);
+      if (mounted) {
+        setState(() {});
+        toast(context, 'Imported $n new profile(s)');
+      }
+    } catch (e) {
+      if (mounted) toast(context, 'Invalid backup: ${errText(e)}');
+    }
+  }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-          title: const Text('Settings'),
-          actions: [TextButton(onPressed: _save, child: const Text('Save'))],
-        ),
-        body: ListView(padding: const EdgeInsets.all(16), children: [
-          _h('DNS changer'),
-          DropdownButtonFormField<String>(
-            initialValue: s.dnsPreset,
-            decoration: _dec('DNS'),
+  Widget build(BuildContext context) {
+    final s = c.settings;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Settings')),
+      body: ListView(children: [
+        _h('Connection'),
+        _sw('Auto-reconnect', 'Retry with back-off when the tunnel drops', s.autoReconnect, (v) => s.autoReconnect = v),
+        if (s.autoReconnect) _num('Max retries', s.reconnectMax, 0, 50, (v) => s.reconnectMax = v),
+        _sw('Connect on launch', 'Connect the selected profile when the app starts', s.autoConnect, (v) => s.autoConnect = v),
+        _sw('Health check', 'Probe through the tunnel and reconnect when it stalls', s.watchdog, (v) => s.watchdog = v),
+        if (s.watchdog) ...[
+          _text('Health-check URL', s.watchdogUrl, (v) => s.watchdogUrl = v.isEmpty ? 'https://www.gstatic.com/generate_204' : v),
+          _num('Interval (seconds)', s.watchdogInterval, 15, 300, (v) => s.watchdogInterval = v),
+          _num('Failures before reconnect', s.watchdogFails, 1, 10, (v) => s.watchdogFails = v),
+        ],
+        _h('DNS'),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: DropdownButtonFormField<String>(
+            initialValue: ['default', 'google', 'cloudflare', 'quad9', 'adguard', 'opendns', 'custom'].contains(s.dnsPreset) ? s.dnsPreset : 'default',
+            decoration: const InputDecoration(labelText: 'Resolver'),
             items: const [
               DropdownMenuItem(value: 'default', child: Text('Default')),
-              DropdownMenuItem(value: 'google', child: Text('Google')),
-              DropdownMenuItem(value: 'cloudflare', child: Text('Cloudflare')),
-              DropdownMenuItem(value: 'quad9', child: Text('Quad9')),
-              DropdownMenuItem(value: 'adguard', child: Text('AdGuard')),
+              DropdownMenuItem(value: 'google', child: Text('Google 8.8.8.8')),
+              DropdownMenuItem(value: 'cloudflare', child: Text('Cloudflare 1.1.1.1')),
+              DropdownMenuItem(value: 'quad9', child: Text('Quad9 9.9.9.9')),
+              DropdownMenuItem(value: 'adguard', child: Text('AdGuard (ad blocking)')),
+              DropdownMenuItem(value: 'opendns', child: Text('OpenDNS')),
               DropdownMenuItem(value: 'custom', child: Text('Custom')),
             ],
-            onChanged: (v) => setState(() => s.dnsPreset = v!),
+            onChanged: (v) {
+              setState(() => s.dnsPreset = v ?? 'default');
+              c.saveSettings();
+            },
           ),
-          if (s.dnsPreset == 'custom') ...[
-            const SizedBox(height: 12),
-            TextField(controller: _dns1, decoration: _dec('Primary DNS', 'IPv4, IPv6 or https://…')),
-            const SizedBox(height: 12),
-            TextField(controller: _dns2, decoration: _dec('Secondary DNS')),
-          ],
-          const SizedBox(height: 12),
-          TextField(controller: _fb, decoration: _dec('Fallback DNS (optional)')),
-          const Padding(
-            padding: EdgeInsets.only(top: 6),
-            child: Text('SSH mode always resolves DNS over TCP.',
-                style: TextStyle(fontSize: 12)),
+        ),
+        if (s.dnsPreset == 'custom') ...[
+          _text('Primary', s.dns1, (v) => s.dns1 = v, hint: '1.1.1.1 or https://dns.example/dns-query'),
+          _text('Secondary', s.dns2, (v) => s.dns2 = v),
+        ],
+        _text('Fallback resolver (optional)', s.fallbackDns, (v) => s.fallbackDns = v),
+        _sw('IPv4 answers only', 'Avoids unreachable IPv6 addresses on IPv4 tunnels', s.dnsIpv4Only, (v) => s.dnsIpv4Only = v),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 0, 16, 0),
+          child: Text(
+            'App DNS queries are answered by the core\'s resolver using these servers. '
+            'SSH mode always resolves over TCP through the tunnel.',
+            style: TextStyle(fontSize: 12),
           ),
-          _h('VPN engine'),
-          DropdownButtonFormField<String>(
-            initialValue: s.coreEngine,
-            decoration: _dec('Core engine'),
-            items: const [
-              DropdownMenuItem(value: 'xray', child: Text('Xray-core (existing engine)')),
-              DropdownMenuItem(value: 'singbox', child: Text('sing-box (independent engine)')),
+        ),
+        _h('Routing'),
+        _sw('Bypass LAN', 'Keep local network traffic outside the VPN', s.bypassLan, (v) => s.bypassLan = v),
+        ListTile(
+          title: const Text('Apps that bypass the VPN'),
+          subtitle: Text(s.blockedApps.isEmpty ? 'None' : '${s.blockedApps.length} selected'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: _pickApps,
+        ),
+        _h('SSH'),
+        _num('Local SOCKS port', s.socksPort, 1024, 65535, (v) {
+          if (v != kReservedPort) s.socksPort = v;
+        }, help: '1024 - 65535 (not $kReservedPort, used by the core)'),
+        _num('Keep-alive (seconds)', s.sshKeepAlive, 5, 120, (v) => s.sshKeepAlive = v),
+        _sw('Share over hotspot', 'Listen on all interfaces so other devices can use the SOCKS proxy', s.shareHotspot, (v) => s.shareHotspot = v),
+        _h('Stability'),
+        FutureBuilder<bool>(
+          future: Native.ignoringBatteryOptimizations(),
+          builder: (_, snap) => ListTile(
+            title: const Text('Battery optimization'),
+            subtitle: Text(snap.data == true ? 'App is exempt (recommended)' : 'Exempt this app so the system does not kill the tunnel'),
+            trailing: snap.data == true ? const Icon(Icons.check_circle, color: kGood) : const Icon(Icons.open_in_new),
+            onTap: () async {
+              await Native.openBatterySettings();
+            },
+          ),
+        ),
+        ListTile(
+          title: const Text('Always-on VPN & kill switch'),
+          subtitle: const Text('Open Android VPN settings: enable "Always-on VPN" and "Block connections without VPN" for this app'),
+          trailing: const Icon(Icons.open_in_new),
+          onTap: Native.openVpnSettings,
+        ),
+        _h('Appearance'),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: SegmentedButton<String>(
+            segments: const [
+              ButtonSegment(value: 'dark', label: Text('Dark')),
+              ButtonSegment(value: 'light', label: Text('Light')),
+              ButtonSegment(value: 'system', label: Text('System')),
             ],
-            onChanged: (v) => setState(() => s.coreEngine = v ?? 'xray'),
+            selected: {s.themeMode},
+            onSelectionChanged: (v) {
+              setState(() => s.themeMode = v.first);
+              c.saveSettings();
+            },
           ),
-          const Padding(
-            padding: EdgeInsets.only(top: 6),
-            child: Text('sing-box supports standard compatible links and sing-box JSON. Custom SSH payload profiles continue to use the existing Xray SOCKS bridge. Unsupported link transports fail validation instead of silently falling back.', style: TextStyle(fontSize: 12)),
-          ),
-          _h('Connection'),
-          SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Auto-reconnect'),
-              value: s.autoReconnect,
-              onChanged: (v) => setState(() => s.autoReconnect = v)),
-          if (s.autoReconnect)
-            TextField(
-                controller: _max,
-                keyboardType: TextInputType.number,
-                decoration: _dec('Max retries')),
-          SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Bypass LAN / local network'),
-              value: s.bypassLan,
-              onChanged: (v) => setState(() => s.bypassLan = v)),
-          _h('SSH mode'),
-          TextField(
-              controller: _port,
-              keyboardType: TextInputType.number,
-              decoration: _dec('Local SOCKS5 port')),
-          const SizedBox(height: 12),
-          TextField(
-              controller: _ka,
-              keyboardType: TextInputType.number,
-              decoration: _dec('Keep-alive interval (seconds)')),
-          SwitchListTile(
-              contentPadding: EdgeInsets.zero,
-              title: const Text('Expose SSH SOCKS proxy to LAN'),
-              subtitle: const Text('Exposes an authenticated SOCKS5 proxy to devices on your hotspot/LAN. Clients must enter the proxy address, port, username and password. SSH profiles only; this is not transparent routing for every app.'),
-              value: s.shareHotspot,
-              onChanged: (v) => setState(() => s.shareHotspot = v)),
-          if (s.shareHotspot) ...[
-            const SizedBox(height: 10),
-            TextField(controller: _shareUser, autocorrect: false, decoration: _dec('Proxy username')),
-            const SizedBox(height: 10),
-            TextField(controller: _sharePass, obscureText: true, autocorrect: false, decoration: _dec('Proxy password')),
-            const Padding(
-              padding: EdgeInsets.only(top: 6),
-              child: Text('Use a strong, unique password. Saved locally on this phone. Share only with trusted devices.', style: TextStyle(fontSize: 12)),
-            ),
-          ],
-          _h('Apps that bypass the VPN'),
-          Wrap(spacing: 8, runSpacing: 4, children: [
-            for (final e in _quick.entries)
-              ActionChip(
-                label: Text(e.key),
-                onPressed: () {
-                  if (!_apps.text.contains(e.value)) {
-                    _apps.text = '${_apps.text.trim()}\n${e.value}'.trim();
-                  }
-                },
-              ),
-          ]),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _apps,
-            minLines: 4,
-            maxLines: 10,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-            decoration: _dec('Package names, one per line', 'com.example.app'),
-          ),
-        ]),
-      );
+        ),
+        _h('Backup'),
+        ListTile(
+          leading: const Icon(Icons.upload),
+          title: const Text('Export to clipboard'),
+          subtitle: const Text('Profiles, subscriptions and settings. Contains passwords - keep it private.'),
+          onTap: () async {
+            await Clipboard.setData(ClipboardData(text: c.exportBackup()));
+            if (mounted) toast(context, 'Backup copied');
+          },
+        ),
+        ListTile(leading: const Icon(Icons.download), title: const Text('Import from clipboard'), onTap: _import),
+        const SizedBox(height: 32),
+      ]),
+    );
+  }
 }

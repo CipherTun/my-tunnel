@@ -1,255 +1,317 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 
+import 'controller.dart';
+import 'core_config.dart';
 import 'models.dart';
-import 'tools_page.dart';
+import 'ssh_tunnel.dart';
+import 'theme.dart';
+
+const _payloadPresets = <String, String>{
+  'WebSocket upgrade': 'GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]',
+  'HTTP CONNECT': 'CONNECT [host_port] HTTP/1.1[crlf]Host: [host][crlf][crlf]',
+  'CONNECT + WebSocket (split)':
+      'CONNECT [host_port] HTTP/1.1[crlf]Host: [host][crlf][crlf][split]GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]',
+};
 
 class EditPage extends StatefulWidget {
-  const EditPage({super.key, required this.profile, required this.all});
+  const EditPage({super.key, required this.ctrl, required this.profile, this.isNew = false});
+  final VpnController ctrl;
   final Profile profile;
-  final List<Profile> all;
+  final bool isNew;
+
   @override
   State<EditPage> createState() => _EditPageState();
 }
 
 class _EditPageState extends State<EditPage> {
-  late final TextEditingController _name = TextEditingController(text: widget.profile.name);
-  late final TextEditingController _payload =
-      TextEditingController(text: widget.profile.s('payload'));
   late final Map<String, dynamic> _d = Map<String, dynamic>.from(widget.profile.data);
+  late String _name = widget.profile.name;
+  late List<String> _members = [for (final m in (widget.profile.data['members'] as List? ?? const [])) '$m'];
+  int _rev = 0;
 
-  Profile get p => widget.profile;
+  Profile get _p => widget.profile;
 
-  // ---- field helpers ----
-  Widget tf(String k, String label,
-      {int lines = 1,
-      bool obscure = false,
-      TextInputType? type,
-      String def = '',
-      String? hint,
-      bool mono = false}) {
-    if (def.isNotEmpty) _d.putIfAbsent(k, () => def);
+  String _s(String k, [String def = '']) => (_d[k] ?? def).toString();
+
+  Widget _tf(String k, String label, {String? hint, bool obscure = false, int lines = 1, TextInputType? kb, String def = ''}) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: TextFormField(
-        key: ValueKey('f_$k'),
-        initialValue: _d[k]?.toString() ?? '',
-        onChanged: (v) => _d[k] = v,
+        key: ValueKey('$k-$_rev'),
+        initialValue: _s(k, def),
         obscureText: obscure,
-        keyboardType: type,
-        minLines: lines,
         maxLines: obscure ? 1 : lines,
-        style: mono ? const TextStyle(fontFamily: 'monospace', fontSize: 12) : null,
-        decoration: InputDecoration(
-            border: const OutlineInputBorder(),
-            labelText: label,
-            hintText: hint,
-            alignLabelWithHint: true),
+        keyboardType: kb,
+        autocorrect: false,
+        enableSuggestions: false,
+        decoration: InputDecoration(labelText: label, hintText: hint),
+        onChanged: (v) => _d[k] = v,
       ),
     );
   }
 
-  Widget dd(String k, String label, List<String> opts, String def) {
-    final cur = opts.contains(_d[k]) ? _d[k] as String : def;
-    _d[k] = cur;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: DropdownButtonFormField<String>(
-        key: ValueKey('d_${k}_$cur'),
-        initialValue: cur,
-        items: [for (final o in opts) DropdownMenuItem(value: o, child: Text(o))],
-        onChanged: (v) => setState(() => _d[k] = v),
-        decoration: InputDecoration(border: const OutlineInputBorder(), labelText: label),
-      ),
-    );
-  }
-
-  Widget sw(String k, String title, [String? sub]) => SwitchListTile(
+  Widget _sw(String k, String label, {String? sub, bool def = false}) => SwitchListTile(
         contentPadding: EdgeInsets.zero,
-        title: Text(title),
-        subtitle: sub == null ? null : Text(sub),
-        value: _d[k] == true,
+        title: Text(label),
+        subtitle: sub == null ? null : Text(sub, style: const TextStyle(fontSize: 12)),
+        value: _d[k] is bool ? _d[k] as bool : def,
         onChanged: (v) => setState(() => _d[k] = v),
       );
 
-  // ---- per type ----
-  List<Widget> _ssh() => [
-        tf('host', 'SSH host / IP'),
-        tf('port', 'SSH port', type: TextInputType.number, def: '22'),
-        tf('user', 'Username'),
-        tf('pass', 'Password', obscure: true),
-        tf('keyPem', 'Private key (PEM, optional)', lines: 4, mono: true),
-        tf('keyPass', 'Key passphrase', obscure: true),
-        sw('tls', 'SSL / TLS tunnel (SNI)', 'SSH wrapped in TLS, e.g. stunnel or nginx stream'),
-        if (_d['tls'] == true)
-          tf('sni', 'SNI', hint: 'cdn.example.com   or   [random=a.com,b.com]  [rotate=...]'),
-        tf('proxyHost', 'Remote HTTP proxy host (optional)'),
-        tf('proxyPort', 'Remote proxy port', type: TextInputType.number, def: '8080'),
-        const Divider(),
-        Row(children: [
-          Expanded(
-              child: Text('Custom payload', style: Theme.of(context).textTheme.titleSmall)),
-          TextButton.icon(
-            icon: const Icon(Icons.auto_fix_high),
-            label: const Text('Generator'),
-            onPressed: () async {
-              final r = await Navigator.push<String>(context,
-                  MaterialPageRoute(builder: (_) => const PayloadGeneratorPage(pick: true)));
-              if (r != null) setState(() => _payload.text = r);
-            },
-          ),
-        ]),
-        Padding(
-          padding: const EdgeInsets.only(bottom: 12),
-          child: TextField(
-            controller: _payload,
-            minLines: 5,
-            maxLines: 8,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-            decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                alignLabelWithHint: true,
-                labelText: 'Payload (blank = none)',
-                hintText: 'GET / [protocol][crlf]Host: [host][crlf]'
-                    'Upgrade: websocket[crlf][crlf]'),
-          ),
-        ),
-        sw('ws', 'WebSocket framing after upgrade',
-            'Enable only if the server is a framed WS→SSH gateway'),
-      ];
-
-  static const _protos = ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria2', 'socks'];
-
-  List<Widget> _v2() {
-    final mode = _d['mode'] == 'link' || _d['mode'] == 'json' ? _d['mode'] as String : 'gui';
-    _d['mode'] = mode;
-    return [
-      SegmentedButton<String>(
-        segments: const [
-          ButtonSegment(value: 'gui', label: Text('Manual')),
-          ButtonSegment(value: 'link', label: Text('Link')),
-          ButtonSegment(value: 'json', label: Text('JSON')),
-        ],
-        selected: {mode},
-        onSelectionChanged: (s) => setState(() => _d['mode'] = s.first),
+  Widget _dd(String k, String label, List<String> items, String def) {
+    final cur = items.contains(_s(k, def)) ? _s(k, def) : def;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: DropdownButtonFormField<String>(
+        key: ValueKey('$k-dd-$cur'),
+        initialValue: cur,
+        decoration: InputDecoration(labelText: label),
+        items: [for (final i in items) DropdownMenuItem(value: i, child: Text(i.isEmpty ? '(none)' : i))],
+        onChanged: (v) => setState(() => _d[k] = v ?? def),
       ),
-      const SizedBox(height: 16),
-      if (mode == 'link')
-        tf('link', 'vmess:// vless:// trojan:// ss:// hysteria2:// socks:// link', lines: 6, mono: true),
-      if (mode == 'json')
-        tf('json', 'Full Xray JSON config', lines: 16, mono: true),
-      if (mode == 'gui') ..._v2gui(),
-    ];
+    );
   }
 
-  List<Widget> _v2gui() {
-    final proto = _protos.contains(_d['proto']) ? _d['proto'] as String : 'vless';
-    final net = (_d['network'] ?? 'tcp') as String;
-    final sec = (_d['security'] ?? 'none') as String;
-    final web = proto == 'vless' || proto == 'vmess' || proto == 'trojan';
+  Widget _section(String t) => Padding(
+        padding: const EdgeInsets.only(top: 8, bottom: 10),
+        child: Text(t, style: TextStyle(fontWeight: FontWeight.w700, color: Theme.of(context).colorScheme.primary)),
+      );
+
+  List<Widget> _ssh() => [
+        _section('Server'),
+        _tf('host', 'Host / IP', kb: TextInputType.url),
+        _tf('port', 'Port', kb: TextInputType.number, def: '22'),
+        _tf('user', 'Username'),
+        _tf('pass', 'Password', obscure: true),
+        _tf('key', 'Private key (PEM, optional)', lines: 4),
+        _tf('keyPass', 'Key passphrase', obscure: true),
+        _section('Transport'),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: PopupMenuButton<String>(
+            onSelected: (k) => setState(() {
+              _d['payload'] = _payloadPresets[k];
+              _rev++;
+            }),
+            itemBuilder: (_) => [for (final k in _payloadPresets.keys) PopupMenuItem(value: k, child: Text(k))],
+            child: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 6),
+              child: Row(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.auto_fix_high, size: 18), SizedBox(width: 6), Text('Payload templates')]),
+            ),
+          ),
+        ),
+        _tf('payload', 'Payload', lines: 4, hint: '[host] [port] [host_port] [crlf] [split]'),
+        _tf('proxyHost', 'HTTP proxy host (optional)'),
+        _tf('proxyPort', 'HTTP proxy port', kb: TextInputType.number, def: '8080'),
+        _sw('tls', 'TLS / SNI wrapper', sub: 'Wrap the connection in TLS before the payload'),
+        if (_d['tls'] == true) _tf('sni', 'SNI (server name)', hint: 'defaults to host'),
+        _sw('ws', 'WebSocket framing', sub: 'Use after a 101 Switching Protocols response'),
+        _section('Security'),
+        _sw('legacy', 'Allow legacy SSH algorithms',
+            sub: 'Needed by old Dropbear/OpenSSH servers. Modern algorithms are still preferred.', def: true),
+        _sw('verifyHost', 'Verify server host key',
+            sub: 'Pins the key on first connect and refuses changes (blocks MITM)'),
+        if (_s('hostKey').isNotEmpty)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => setState(() => _d.remove('hostKey')),
+              icon: const Icon(Icons.restart_alt),
+              label: const Text('Reset pinned host key'),
+            ),
+          ),
+        if (_d['tls'] == true) ...[
+          _sw('verifyTls', 'Validate TLS certificate', sub: 'Off by default: SNI-fronted hosts rarely match'),
+          _tf('pin', 'Pin certificate SHA-256 (optional)', hint: 'hex fingerprint'),
+        ],
+      ];
+
+  static const _protos = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2'];
+
+  List<Widget> _v2() {
+    final mode = _s('mode', 'link');
+    final proto = _s('proto', 'vless');
     return [
-      dd('proto', 'Protocol', _protos, 'vless'),
-      tf('address', 'Server address'),
-      tf('port', 'Port', type: TextInputType.number, def: '443'),
-      if (proto == 'socks') tf('user', 'Username (optional)'),
-      tf('id', proto == 'vless' || proto == 'vmess' ? 'UUID' : 'Password / auth'),
-      if (proto == 'vless') ...[
-        tf('encryption', 'VLESS encryption', def: 'none'),
-        dd('flow', 'Flow', ['none', 'xtls-rprx-vision'], 'none'),
-      ],
-      if (proto == 'vmess') ...[
-        dd('scy', 'VMess security', ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none'], 'auto'),
-        tf('aid', 'Alter ID', type: TextInputType.number, def: '0'),
-      ],
-      if (proto == 'shadowsocks')
-        dd('method', 'Cipher', [
-          'aes-256-gcm',
-          'aes-128-gcm',
-          'chacha20-ietf-poly1305',
-          '2022-blake3-aes-128-gcm',
-          '2022-blake3-aes-256-gcm',
-          '2022-blake3-chacha20-poly1305',
-        ], 'aes-256-gcm'),
-      if (web) ...[
-        dd('network', 'Transport', ['tcp', 'ws', 'grpc', 'httpupgrade', 'xhttp', 'kcp'], 'tcp'),
-        if (net == 'ws' || net == 'httpupgrade' || net == 'xhttp') ...[
-          tf('host', 'Host header'),
-          tf('path', 'Path', def: '/'),
+      Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: SegmentedButton<String>(
+          segments: const [
+            ButtonSegment(value: 'link', label: Text('Link')),
+            ButtonSegment(value: 'gui', label: Text('Guided')),
+            ButtonSegment(value: 'json', label: Text('JSON')),
+          ],
+          selected: {mode},
+          onSelectionChanged: (s) => setState(() => _d['mode'] = s.first),
+        ),
+      ),
+      if (mode == 'link') _tf('link', 'Share link', lines: 4, hint: 'vless:// vmess:// trojan:// ss:// hysteria2://'),
+      if (mode == 'json') _tf('json', 'Xray JSON config', lines: 12),
+      if (mode == 'gui') ...[
+        _dd('proto', 'Protocol', _protos, 'vless'),
+        _tf('address', 'Server address', kb: TextInputType.url),
+        _tf('port', 'Port', kb: TextInputType.number, def: '443'),
+        _tf('id', proto == 'vless' || proto == 'vmess' ? 'UUID' : 'Password', obscure: false),
+        if (proto == 'ss') _tf('method', 'Cipher', def: 'aes-256-gcm'),
+        if (proto == 'vless') _tf('encryption', 'Encryption', def: 'none'),
+        if (proto != 'ss' && proto != 'hysteria2') ...[
+          _dd('net', 'Transport', const ['tcp', 'ws', 'grpc', 'httpupgrade', 'xhttp'], 'tcp'),
+          _dd('security', 'Security', const ['tls', 'reality', 'none'], 'tls'),
+          _tf('host', 'Host header'),
+          _tf('path', 'Path / service name'),
         ],
-        if (net == 'grpc') tf('path', 'gRPC service name'),
-        if (net == 'kcp') tf('path', 'mKCP seed (optional)'),
-        dd('security', 'Security', ['none', 'tls', 'reality'], 'none'),
-        if (sec != 'none') ...[
-          tf('sni', 'SNI / server name'),
-          dd('fp', 'uTLS fingerprint',
-              ['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'randomized', 'none'], 'chrome'),
-          tf('alpn', 'ALPN (e.g. h2,http/1.1)'),
-          tf('pcs', 'Pinned cert SHA-256 (optional)'),
+        if (proto != 'ss') _tf('sni', 'SNI'),
+        if (proto != 'ss' && proto != 'hysteria2') ...[
+          _dd('fp', 'Fingerprint', const ['', 'chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'random'], ''),
+          _tf('alpn', 'ALPN', hint: 'h2,http/1.1'),
         ],
-        if (sec == 'reality') ...[
-          tf('pbk', 'REALITY public key'),
-          tf('sid', 'REALITY short ID'),
-          tf('spx', 'REALITY spiderX'),
+        if (proto == 'vless') ...[
+          _tf('flow', 'Flow', hint: 'xtls-rprx-vision'),
+          if (_s('security') == 'reality') ...[
+            _tf('pbk', 'Reality public key'),
+            _tf('sid', 'Reality short id'),
+            _tf('spx', 'Reality spiderX'),
+          ],
         ],
-      ],
-      if (proto == 'hysteria2') ...[
-        tf('sni', 'SNI'),
-        tf('obfsPass', 'Salamander obfs password (optional)'),
-        tf('mport', 'Port hopping range (e.g. 20000-30000)'),
-        tf('pcs', 'Pinned cert SHA-256 (optional)'),
+        if (proto == 'hysteria2') ...[
+          _tf('obfs', 'Obfuscation', hint: 'salamander'),
+          _tf('obfsPassword', 'Obfuscation password'),
+          _tf('mport', 'Port hopping range', hint: '20000-30000'),
+        ],
+        _tf('pcs', 'Pinned certificate SHA-256 (optional)'),
       ],
     ];
   }
 
   List<Widget> _group() {
-    final members = ((_d['members'] as List?) ?? []).map((e) => e.toString()).toList();
-    final others = widget.all.where((e) => e.type != ProfileType.group && e.id != p.id);
-    if (others.isEmpty) return [const Text('Create some profiles first.')];
+    final others = widget.ctrl.profiles.where((e) => e.type != ProfileType.group && e.id != _p.id).toList();
+    String nameOf(String id) {
+      for (final e in widget.ctrl.profiles) {
+        if (e.id == id) return e.name;
+      }
+      return id;
+    }
+
     return [
-      const Text('Tick servers in the order they should be tried. If one fails, the next is used.'),
-      for (final o in others)
-        CheckboxListTile(
-          contentPadding: EdgeInsets.zero,
-          value: members.contains(o.id),
-          title: Text(o.name),
-          subtitle: Text(o.subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
-          secondary: members.contains(o.id) ? Text('#${members.indexOf(o.id) + 1}') : null,
-          onChanged: (v) => setState(() {
-            v == true ? members.add(o.id) : members.remove(o.id);
-            _d['members'] = members;
-          }),
+      _section('Order (drag to reorder) - tried top to bottom'),
+      if (_members.isEmpty) const Padding(padding: EdgeInsets.only(bottom: 8), child: Text('No members yet')),
+      ReorderableListView(
+        shrinkWrap: true,
+        physics: const NeverScrollableScrollPhysics(),
+        buildDefaultDragHandles: true,
+        onReorder: (a, b) => setState(() {
+          if (b > a) b--;
+          _members.insert(b, _members.removeAt(a));
+        }),
+        children: [
+          for (final id in _members)
+            ListTile(
+              key: ValueKey('m-$id'),
+              dense: true,
+              leading: const Icon(Icons.drag_handle),
+              title: Text(nameOf(id)),
+              trailing: IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() => _members.remove(id))),
+            ),
+        ],
+      ),
+      _section('Available profiles'),
+      for (final e in others.where((e) => !_members.contains(e.id)))
+        ListTile(
+          dense: true,
+          title: Text(e.name),
+          subtitle: Text(e.typeLabel),
+          trailing: const Icon(Icons.add_circle_outline),
+          onTap: () => setState(() => _members.add(e.id)),
         ),
     ];
   }
 
-  void _save() {
-    final t = _name.text.trim();
-    if (t.isNotEmpty) p.name = t;
-    if (p.type == ProfileType.ssh) _d['payload'] = _payload.text;
-    p.data = _d;
-    Navigator.pop(context, p);
+  Future<void> _save() async {
+    final name = _name.trim();
+    if (name.isEmpty) {
+      toast(context, 'Name is required');
+      return;
+    }
+    final err = _validate();
+    if (err != null) {
+      toast(context, err);
+      return;
+    }
+    _p.name = name;
+    _p.data = Map<String, dynamic>.from(_d);
+    if (_p.type == ProfileType.group) _p.data['members'] = _members;
+    await widget.ctrl.upsert(_p);
+    if (mounted) Navigator.pop(context);
+  }
+
+  String? _validate() {
+    switch (_p.type) {
+      case ProfileType.ssh:
+        if (_s('host').trim().isEmpty) return 'Host is required';
+        if (_s('user').trim().isEmpty) return 'Username is required';
+        final port = int.tryParse(_s('port', '22'));
+        if (port == null || port < 1 || port > 65535) return 'Port must be 1-65535';
+        if (_s('pass').isEmpty && _s('key').trim().isEmpty) return 'Enter a password or a private key';
+        return null;
+      case ProfileType.v2ray:
+        final mode = _s('mode', 'link');
+        if (mode == 'link' && !_s('link').contains('://')) return 'Paste a valid share link';
+        if (mode == 'json') {
+          try {
+            jsonDecode(_s('json'));
+          } catch (_) {
+            return 'JSON is not valid';
+          }
+        }
+        if (mode == 'gui') {
+          try {
+            final tmp = Profile(id: _p.id, name: _name, type: ProfileType.v2ray, data: Map<String, dynamic>.from(_d));
+            buildShareLink(tmp);
+          } catch (e) {
+            return errText(e);
+          }
+        }
+        return null;
+      case ProfileType.wireguard:
+        final c = _s('conf');
+        if (!c.contains('[Interface]') || !c.contains('[Peer]')) return 'Config needs [Interface] and [Peer]';
+        return null;
+      case ProfileType.group:
+        return _members.isEmpty ? 'Add at least one member' : null;
+    }
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-          title: Text(typeLabel(p.type)),
-          actions: [TextButton(onPressed: _save, child: const Text('Save'))],
-        ),
-        body: ListView(padding: const EdgeInsets.all(16), children: [
-          TextField(
-            controller: _name,
-            decoration: const InputDecoration(
-                border: OutlineInputBorder(), labelText: 'Profile name'),
+  Widget build(BuildContext context) {
+    final t = _p.type;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.isNew ? 'New ${_p.typeLabel}' : 'Edit profile'),
+        actions: [TextButton(onPressed: _save, child: const Text('Save'))],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextFormField(
+            initialValue: _name,
+            decoration: const InputDecoration(labelText: 'Name'),
+            onChanged: (v) => _name = v,
           ),
           const SizedBox(height: 12),
-          ...switch (p.type) {
-            ProfileType.ssh => _ssh(),
-            ProfileType.v2ray => _v2(),
-            ProfileType.wireguard => [
-                tf('config', 'WireGuard config (wg-quick format)', lines: 14, mono: true)
-              ],
-            ProfileType.group => _group(),
-          },
-        ]),
-      );
+          if (t == ProfileType.ssh) ..._ssh(),
+          if (t == ProfileType.v2ray) ..._v2(),
+          if (t == ProfileType.wireguard) _tf('conf', 'WireGuard config', lines: 12),
+          if (t == ProfileType.group) ..._group(),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+}
+
+/// Used by the payload preview in Tools.
+String previewPayload(String raw, String host, int port) {
+  final parts = renderPayload(raw, host, port);
+  return parts.map((e) => e.replaceAll('\r', '\\r').replaceAll('\n', '\\n\n')).join('\n---- split ----\n');
 }

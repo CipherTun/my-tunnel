@@ -42,13 +42,20 @@ class VpnController extends ChangeNotifier {
   }
 
   Future<void> init() async {
-    profiles
-      ..clear()
-      ..addAll(await Store.loadProfiles());
-    settings = await Store.loadSettings();
-    selectedId = await Store.loadSelected() ??
-        (profiles.isNotEmpty ? profiles.first.id : null);
     try {
+      log('Startup: loading saved profiles');
+      profiles
+        ..clear()
+        ..addAll(await Store.loadProfiles());
+
+      log('Startup: loading settings');
+      settings = await Store.loadSettings();
+
+      log('Startup: loading selected profile');
+      selectedId = await Store.loadSelected() ??
+          (profiles.isNotEmpty ? profiles.first.id : null);
+
+      log('Startup: initializing VPN engine');
       await _box.initialize(
         notificationStopButtonText: 'Disconnect',
         notificationIconName: 'ic_launcher',
@@ -56,13 +63,20 @@ class VpnController extends ChangeNotifier {
       await _box.setServiceMode(VpnMode.vpn);
       _boxStateSub ??= _box.watchStatus().listen(
         _onBoxStatus,
-        onError: (Object error) => log('VPN status stream error: $error'),
+        onError: (Object error, StackTrace stackTrace) {
+          log('VPN status stream error: $error');
+          log(stackTrace.toString());
+        },
       );
       log('Unified Xray/sing-box engine initialized');
-    } catch (e) {
-      log('VPN core initialization failed: $e');
+    } catch (e, stackTrace) {
+      // init() is launched from State.initState(); contain asynchronous
+      // startup failures and expose their details in the app's Logs screen.
+      log('Startup initialization failed: $e');
+      log(stackTrace.toString());
+    } finally {
+      notifyListeners();
     }
-    notifyListeners();
   }
 
   // ---------- profiles & settings ----------

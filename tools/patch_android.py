@@ -139,12 +139,12 @@ def patch_gradle():
     # AGP 8.1+ removed android.bundle.enableUncompressedNativeLibs.
     # Native library packaging is configured through useLegacyPackaging above.
     g = re.sub(
-        r"(?m)^\\s*android\\.bundle\\.enableUncompressedNativeLibs\\s*=.*(?:\\n|$)",
+        r"(?m)^\s*android\.bundle\.enableUncompressedNativeLibs\s*=.*(?:\n|$)",
         "",
         g,
     )
-    if not re.search(r"(?m)^\\s*android\\.useAndroidX\\s*=\\s*true\\s*$", g):
-        g += ("\\n" if g and not g.endswith("\\n") else "") + "android.useAndroidX=true\\n"
+    if not re.search(r"(?m)^\s*android\.useAndroidX\s*=\s*true\s*$", g):
+        g += ("\n" if g and not g.endswith("\n") else "") + "android.useAndroidX=true\n"
     write(gp, g)
 
 

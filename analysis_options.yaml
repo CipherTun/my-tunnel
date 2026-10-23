@@ -1,7 +1,0 @@
-# Kept minimal on purpose: `flutter create` would otherwise add an include of
-# package:flutter_lints, which is not a dependency of this project.
-analyzer:
-  errors:
-    invalid_annotation_target: ignore
-linter:
-  rules: {}

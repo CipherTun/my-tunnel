@@ -1,18 +1,18 @@
-name: Build XRay Vpn
+name: Build XRay Vpn - ZIP A feature variant
 
 on:
   push:
     branches:
-      - test/xray-vpn-zip-as-is
+      - test/xray-vpn-zip-a-features
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  apk:
+  android:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -21,18 +21,16 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Pinned to a minor so a new Flutter/AGP release cannot silently break the build.
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           flutter-version: 3.47.x
           cache: true
 
-      - name: Generate Android project (package xyz.xray.vpn)
+      - name: Generate Android project
         run: |
-          flutter --version
           flutter create --platforms=android --org xyz.xray --project-name vpn .
-          rm -rf test
+          rm -f test/widget_test.dart
 
       - name: Patch Android project
         run: python3 tools/patch_android.py
@@ -40,14 +38,16 @@ jobs:
       - name: Dependencies
         run: flutter pub get
 
-      # Compile errors surface here in seconds instead of after a long Gradle build.
       - name: Analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
-      - name: Build APK
+      - name: Unit tests
+        run: flutter test
+
+      - name: Build ABI-split APKs
         run: flutter build apk --release --split-per-abi
 
-      - name: Sign split APKs
+      - name: Sign and verify ABI APKs
         env:
           RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -59,15 +59,13 @@ jobs:
           BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           shopt -s nullglob
           APKS=(build/app/outputs/flutter-apk/app-*-release.apk)
-
           if [ "${#APKS[@]}" -ne 3 ]; then
-            echo "::error::Expected three ABI-split release APKs; found ${#APKS[@]}."
+            echo "::error::Expected 3 ABI APKs; found ${#APKS[@]}"
             ls -la build/app/outputs/flutter-apk/ || true
             exit 1
           fi
-
           for IN in "${APKS[@]}"; do
-            OUT="dist/XRayVpn-${IN##*/app-}"
+            OUT="dist/XRayVpn-ZIPA-${IN##*/app-}"
             if [ -n "$RELEASE_KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ]; then
               echo "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.p12"
               ARGS=(sign --ks "$RUNNER_TEMP/release.p12" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD)
@@ -76,14 +74,15 @@ jobs:
               "$BT/apksigner" verify "$OUT"
               rm -f "$RUNNER_TEMP/release.p12"
             else
-              echo "::warning::Signing secrets are incomplete; copying the build-produced APK without release-key signing."
+              echo "::warning::Signing secrets are incomplete; retaining the build-produced APK signature."
               cp "$IN" "$OUT"
             fi
-            echo "Prepared: $OUT"
+            "$BT/aapt" dump badging "$OUT" | grep -Fq "package: name='xyz.xray.vpn'"
+            echo "Verified package id: $OUT"
           done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: XRayVpn-split-apks
+          name: XRayVpn-ZIPA-split-apks
           path: dist/*.apk
           if-no-files-found: error

@@ -533,7 +533,13 @@ class VpnController extends ChangeNotifier {
         if (state != ConnState.connected) state = ConnState.connecting;
         break;
       case 'DISCONNECTED':
-        if (state == ConnState.connected && !_userStopped) {
+        final u = _up;
+        if (state == ConnState.connecting &&
+            u != null &&
+            !u.isCompleted &&
+            !_userStopped) {
+          u.completeError('VPN core disconnected before tunnel became ready');
+        } else if (state == ConnState.connected && !_userStopped) {
           unawaited(_dropped());
           return;
         }
@@ -577,7 +583,15 @@ class VpnController extends ChangeNotifier {
         unawaited(_dropped());
       }
     } else if (stage.isDisconnected) {
-      if (state == ConnState.connected && !_userStopped) unawaited(_dropped());
+      final u = _ovpnUp;
+      if (state == ConnState.connecting &&
+          u != null &&
+          !u.isCompleted &&
+          !_userStopped) {
+        u.completeError('OpenVPN disconnected before tunnel became ready');
+      } else if (state == ConnState.connected && !_userStopped) {
+        unawaited(_dropped());
+      }
     } else if (stage.isConnecting) {
       if (state != ConnState.connected) state = ConnState.connecting;
     }

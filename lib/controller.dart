@@ -1,69 +1,76 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_v2ray_client/flutter_v2ray.dart';
+import 'package:openvpn_flutter/openvpn_flutter.dart' as ovpn;
+import 'package:permission_handler/permission_handler.dart';
 
-import 'app_info.dart';
+import 'config_tweaks.dart' show parseOvpnRemote;
 import 'core_config.dart';
 import 'models.dart';
 import 'native.dart';
 import 'ssh_tunnel.dart';
-import 'subscriptions.dart';
+import 'subscription.dart';
+import 'usage.dart';
 
 enum ConnState { disconnected, connecting, connected }
 
-Future<int> tcpPing(String host, int port) async {
-  final sw = Stopwatch()..start();
-  try {
-    final s = await Socket.connect(host, port, timeout: const Duration(seconds: 4));
-    sw.stop();
-    s.destroy();
-    return sw.elapsedMilliseconds;
-  } catch (_) {
-    return -1;
-  }
-}
-
-String errText(Object e) {
-  final s = e.toString();
-  return s.startsWith('Exception: ') ? s.substring(11) : s;
-}
+const _testUrl = 'https://cp.cloudflare.com/generate_204';
 
 class VpnController extends ChangeNotifier {
-  final Store _store = Store();
-  final SshTunnel ssh = SshTunnel();
-  late final V2ray _v2 = V2ray(onStatusChanged: _onV2);
-
-  List<Profile> profiles = [];
-  List<Subscription> subs = [];
+  final List<Profile> profiles = [];
+  final List<Subscription> subs = [];
+  final List<String> logs = [];
   AppSettings settings = AppSettings();
   String? selectedId;
-
   ConnState state = ConnState.disconnected;
-  String? error;
-  String activeName = '';
-  String duration = '00:00:00';
-  int upSpeed = 0;
-  int downSpeed = 0;
-  int upTotal = 0;
-  int downTotal = 0;
-  int? lastDelay;
 
-  final Map<String, int> pings = {};
-  bool pinging = false;
-  final List<String> logs = [];
+  // live stats (from the core)
+  int upSpeed = 0, downSpeed = 0, upTotal = 0, downTotal = 0;
+  String duration = '00:00:00';
+
+  /// profile id -> latency ms; -1 = failed, -2 = testing
+  final Map<String, int> latency = {};
+  String exitIp = '';
+  int tunnelDelay = 0; // ms of the last in-tunnel test, -1 = failed
+
+  // speed test
+  bool speedRunning = false;
+  double speedMbps = 0; // <0 = failed
+  String speedMsg = '';
+
+  final UsageStore usage = UsageStore();
+  int _prevUp = 0, _prevDown = 0;
+  Timer? _usageTimer;
+
+  // OpenVPN runs in its own engine/process
+  late final ovpn.OpenVPN _ovpn = ovpn.OpenVPN(onVpnStageChanged: _onOvpnStage, onVpnStatusChanged: _onOvpnStatus);
+  bool _ovpnActive = false;
+  bool _ovpnReady = false;
+  bool _ovpnSawConnecting = false;
+  String? _ovpnInitError;
+  Completer<void>? _ovpnUp;
 
   Profile? _root;
-  bool _userStopped = false;
+  Profile? _active; // the leaf profile currently running
+  bool _userStopped = true;
   bool _dropping = false;
   int _gen = 0;
   int _retries = 0;
-  Completer<void>? _up;
   Timer? _retryTimer;
-  Timer? _watch;
-  int _watchFails = 0;
+  Timer? _health;
+  int _failStreak = 0;
+  int _lastCheckDown = -1;
+  Completer<void>? _up;
+  Map<String, String> _hosts = {};
+  final SshTunnel _ssh = SshTunnel();
+  late final V2ray _v2 = V2ray(onStatusChanged: _onV2);
+  bool _v2Ready = false;
+  String? _v2InitError;
 
   Profile? get selected {
     for (final p in profiles) {
@@ -72,514 +79,857 @@ class VpnController extends ChangeNotifier {
     return null;
   }
 
-  bool get busy => state != ConnState.disconnected;
-
-  // ------------------------------------------------------------------ logging
+  Profile? byId(String id) {
+    for (final p in profiles) {
+      if (p.id == id) return p;
+    }
+    return null;
+  }
 
   void log(String m) {
-    final n = DateTime.now();
-    String two(int v) => v.toString().padLeft(2, '0');
-    logs.add('${two(n.hour)}:${two(n.minute)}:${two(n.second)}  $m');
-    if (logs.length > 600) logs.removeRange(0, logs.length - 600);
+    final t = DateTime.now().toIso8601String().substring(11, 19);
+    logs.add('[$t] $m');
+    if (logs.length > 500) logs.removeRange(0, logs.length - 500);
     notifyListeners();
   }
-
-  void clearLogs() {
-    logs.clear();
-    notifyListeners();
-  }
-
-  // --------------------------------------------------------------------- init
 
   Future<void> init() async {
-    await _store.init();
-    profiles = _store.loadProfiles();
-    subs = _store.loadSubs();
-    settings = _store.loadSettings();
-    selectedId = _store.loadSelected();
-    if (selected == null) selectedId = profiles.isEmpty ? null : profiles.first.id;
+    profiles
+      ..clear()
+      ..addAll(await Store.loadProfiles());
+    subs
+      ..clear()
+      ..addAll(await Store.loadSubs());
+    _hosts = await Store.loadHosts();
+    settings = await Store.loadSettings();
+    selectedId = await Store.loadSelected() ?? (profiles.isNotEmpty ? profiles.first.id : null);
+    if (selected == null && profiles.isNotEmpty) selectedId = profiles.first.id;
     try {
       await _v2.initialize(
         notificationIconResourceType: 'mipmap',
-        notificationIconResourceName: 'ic_stat_vpn',
+        notificationIconResourceName: 'ic_launcher',
       );
+      _v2Ready = true;
+      _v2InitError = null;
+      log('Xray engine initialized');
+      // Cleanup is best-effort and must not make a successfully initialized
+      // engine look unavailable.
+      try {
+        await _v2.stopV2Ray();
+      } catch (e) {
+        log('Xray stale-session cleanup warning: $e');
+      }
     } catch (e) {
-      log('Core init failed: ${errText(e)}');
+      _v2Ready = false;
+      _v2InitError = '$e';
+      log('Xray engine initialization failed: $e');
     }
     try {
-      final v = await _v2.getCoreVersion();
-      log('Xray core $v');
+      await _ovpn.initialize(
+        localizedDescription: 'XRay Vpn',
+        lastStage: (ovpn.VPNStage s) {
+          // OpenVPN lives in its own process; clean up a tunnel we no longer control.
+          if (_root == null && (s.isConnected || s.isConnecting)) unawaited(_ovpn.disconnect());
+        },
+      );
+      _ovpnReady = true;
+      _ovpnInitError = null;
+      log('OpenVPN engine initialized');
+    } catch (e) {
+      _ovpnReady = false;
+      _ovpnInitError = '$e';
+      log('OpenVPN engine initialization failed: $e');
+    }
+    try {
+      await Permission.notification.request(); // Android 13+: foreground notification
     } catch (_) {}
-    Native.requestNotifications();
+    await usage.load();
+    _usageTimer = Timer.periodic(const Duration(seconds: 60), (_) => usage.save());
     notifyListeners();
+    if (settings.autoUpdateSubs) await _autoUpdateSubs();
     if (settings.autoConnect && selected != null) {
-      log('Auto-connect on launch');
       unawaited(connect());
     }
   }
 
-  // ----------------------------------------------------------------- profiles
-
-  Future<void> saveProfiles() => _store.saveProfiles(profiles);
-
-  Future<void> saveSettings() async {
-    await _store.saveSettings(settings);
-    notifyListeners();
-  }
-
-  Future<void> select(String id) async {
-    if (busy) return;
-    selectedId = id;
-    await _store.saveSelected(id);
-    notifyListeners();
-  }
-
+  // ---------- profiles & settings ----------
   Future<void> upsert(Profile p) async {
     final i = profiles.indexWhere((e) => e.id == p.id);
-    if (i >= 0) {
-      profiles[i] = p;
-    } else {
-      profiles.add(p);
-    }
+    i >= 0 ? profiles[i] = p : profiles.add(p);
     selectedId ??= p.id;
-    await saveProfiles();
-    await _store.saveSelected(selectedId);
+    await _persist();
+  }
+
+  Future<void> _persist() async {
+    await Store.saveProfiles(profiles);
+    await Store.saveSelected(selectedId);
     notifyListeners();
+  }
+
+  void _pruneGroups() {
+    final ids = profiles.map((e) => e.id).toSet();
+    for (final g in profiles.where((e) => e.type == ProfileType.group)) {
+      final m = g.members.where(ids.contains).toList();
+      g.data['members'] = m;
+    }
+    if (selectedId != null && !ids.contains(selectedId)) {
+      selectedId = profiles.isNotEmpty ? profiles.first.id : null;
+    }
   }
 
   Future<void> remove(String id) async {
     profiles.removeWhere((e) => e.id == id);
-    for (final g in profiles.where((e) => e.type == ProfileType.group)) {
-      (g.data['members'] as List?)?.remove(id);
-    }
-    pings.remove(id);
-    if (selectedId == id) selectedId = profiles.isEmpty ? null : profiles.first.id;
-    await saveProfiles();
-    await _store.saveSelected(selectedId);
+    latency.remove(id);
+    _pruneGroups();
+    await _persist();
+  }
+
+  Future<void> select(String id) async {
+    selectedId = id;
+    await Store.saveSelected(id);
     notifyListeners();
   }
 
-  Future<Profile?> importText(String text) async {
-    final p = importProfile(text);
-    if (p == null) return null;
-    await upsert(p);
-    return p;
+  Future<void> saveSettings(AppSettings s) async {
+    settings = s;
+    await Store.saveSettings(s);
+    notifyListeners();
   }
 
-  Future<void> duplicate(Profile p) async {
-    final c = Profile.fromJson(jsonDecode(jsonEncode(p.toJson())) as Map<String, dynamic>)
-      ..id = newId()
-      ..name = '${p.name} copy'
-      ..subId = null;
-    c.data.remove('hostKey');
-    await upsert(c);
+  Future<void> resetPinnedKey(Profile p) async {
+    _hosts.remove(p.hostKey);
+    await Store.saveHosts(_hosts);
+    log('Pinned host key cleared for ${p.hostKey}');
   }
 
-  // ------------------------------------------------------------ subscriptions
+  bool hasPinnedKey(Profile p) => _hosts.containsKey(p.hostKey);
 
+  Future<void> clearAllPinnedKeys() async {
+    _hosts.clear();
+    await Store.saveHosts(_hosts);
+    notifyListeners();
+  }
+
+  // ---------- subscriptions ----------
   Future<int> addSubscription(String name, String url) async {
-    final s = Subscription(id: newId(), name: name.trim().isEmpty ? Uri.parse(url).host : name.trim(), url: url.trim());
-    final n = await _refresh(s);
-    subs.add(s);
-    await _store.saveSubs(subs);
+    final u = url.trim();
+    final host = Uri.tryParse(u)?.host ?? '';
+    final sub = Subscription(id: newId(), name: name.trim().isEmpty ? host : name.trim(), url: u);
+    final n = await _syncSub(sub);
+    subs.add(sub);
+    await Store.saveSubs(subs);
     notifyListeners();
     return n;
   }
 
-  Future<int> updateSubscription(Subscription s) async {
-    final n = await _refresh(s);
-    await _store.saveSubs(subs);
+  Future<int> updateSubscription(String id) async {
+    final sub = subs.firstWhere((s) => s.id == id);
+    final n = await _syncSub(sub);
+    await Store.saveSubs(subs);
     notifyListeners();
     return n;
   }
 
-  Future<void> removeSubscription(Subscription s, {bool withProfiles = true}) async {
-    subs.removeWhere((e) => e.id == s.id);
+  Future<void> removeSubscription(String id, {bool withProfiles = true}) async {
+    subs.removeWhere((s) => s.id == id);
     if (withProfiles) {
-      final ids = profiles.where((p) => p.subId == s.id).map((p) => p.id).toList();
-      for (final id in ids) {
-        await remove(id);
-      }
-    } else {
-      for (final p in profiles.where((p) => p.subId == s.id)) {
-        p.subId = null;
-      }
-      await saveProfiles();
+      profiles.removeWhere((p) => p.subId == id);
+      _pruneGroups();
     }
-    await _store.saveSubs(subs);
+    await Store.saveSubs(subs);
+    await _persist();
+  }
+
+  Future<int> _syncSub(Subscription sub) async {
+    final body = await fetchSubscription(sub.url);
+    final links = parseSubscriptionBody(body);
+    if (links.isEmpty) throw 'No supported links found in the subscription';
+    final wasSelected = selected;
+    final keepName = wasSelected != null && wasSelected.subId == sub.id ? wasSelected.name : null;
+    profiles.removeWhere((p) => p.subId == sub.id);
+    final added = <Profile>[];
+    for (final l in links) {
+      final p = importProfile(l, id: newId());
+      if (p == null) continue;
+      p.data['sub'] = sub.id;
+      added.add(p);
+    }
+    profiles.addAll(added);
+    _pruneGroups();
+    if (keepName != null) {
+      final same = added.where((p) => p.name == keepName);
+      if (same.isNotEmpty) selectedId = same.first.id;
+    }
+    if (selected == null && added.isNotEmpty) selectedId = added.first.id;
+    sub.updated = DateTime.now().millisecondsSinceEpoch;
+    await Store.saveProfiles(profiles);
+    await Store.saveSelected(selectedId);
+    return added.length;
+  }
+
+  Future<void> clearUsage() async {
+    await usage.clear();
     notifyListeners();
   }
 
-  Future<int> _refresh(Subscription s) async {
-    final body = await fetchSubscription(s.url);
-    final fresh = parseSubscription(body, s.id);
-    if (fresh.isEmpty) throw 'No supported links found in this subscription';
-    final old = {for (final p in profiles.where((p) => p.subId == s.id)) profileKey(p): p};
-    final keep = <Profile>[];
-    for (final p in fresh) {
-      keep.add(old[profileKey(p)] ?? p);
+  Future<void> _autoUpdateSubs() async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    for (final s in List<Subscription>.of(subs)) {
+      if (state != ConnState.disconnected) return;
+      if (now - s.updated < 24 * 3600 * 1000) continue;
+      try {
+        final n = await updateSubscription(s.id);
+        log('Subscription "${s.name}" refreshed: $n servers');
+      } catch (e) {
+        log('Subscription "${s.name}" refresh failed: $e');
+      }
     }
-    final keepIds = keep.map((e) => e.id).toSet();
-    profiles.removeWhere((p) => p.subId == s.id && !keepIds.contains(p.id));
-    for (final p in keep) {
-      if (!profiles.any((e) => e.id == p.id)) profiles.add(p);
-    }
-    if (selected == null && profiles.isNotEmpty) selectedId = profiles.first.id;
-    s.updated = DateTime.now();
-    await saveProfiles();
-    log('Subscription "${s.name}": ${keep.length} profiles');
-    return keep.length;
   }
 
-  // ------------------------------------------------------------------- backup
+  /// Lowest tested latency first; untested / failed profiles go last.
+  Future<void> sortProfilesByLatency() async {
+    int v(Profile p) {
+      final m = latency[p.id] ?? -1;
+      return m > 0 ? m : (m == -3 ? 1 << 29 : 1 << 30);
+    }
 
-  String exportBackup() => const JsonEncoder.withIndent('  ').convert({
-        'app': kAppId,
-        'version': 3,
-        'profiles': [for (final p in profiles) p.toJson()],
-        'subscriptions': [for (final s in subs) s.toJson()],
+    profiles.sort((a, b) => v(a).compareTo(v(b)));
+    await _persist();
+  }
+
+  // ---------- backup ----------
+  String exportAll() => const JsonEncoder.withIndent('  ').convert({
+        'app': 'xray-vpn',
+        'version': 1,
         'settings': settings.toJson(),
+        'profiles': profiles.map((e) => e.toJson()).toList(),
+        'subscriptions': subs.map((e) => e.toJson()).toList(),
       });
 
-  /// Merges a backup; returns the number of profiles added.
-  Future<int> importBackup(String text) async {
-    final j = jsonDecode(text) as Map<String, dynamic>;
-    var added = 0;
+  /// Merges a backup made by [exportAll]. Returns the number of profiles read.
+  Future<int> importAll(String text) async {
+    final j = jsonDecode(text.trim());
+    if (j is! Map || j['app'] != 'xray-vpn') throw 'Not an XRay Vpn backup';
+    var n = 0;
     for (final e in (j['profiles'] as List? ?? const [])) {
       final p = Profile.fromJson(Map<String, dynamic>.from(e as Map));
-      if (!profiles.any((x) => x.id == p.id)) {
-        profiles.add(p);
-        added++;
-      }
+      final i = profiles.indexWhere((x) => x.id == p.id);
+      i >= 0 ? profiles[i] = p : profiles.add(p);
+      n++;
     }
     for (final e in (j['subscriptions'] as List? ?? const [])) {
       final s = Subscription.fromJson(Map<String, dynamic>.from(e as Map));
       if (!subs.any((x) => x.id == s.id)) subs.add(s);
     }
-    if (j['settings'] is Map) settings.applyJson(Map<String, dynamic>.from(j['settings'] as Map));
-    if (selected == null && profiles.isNotEmpty) selectedId = profiles.first.id;
-    await saveProfiles();
-    await _store.saveSubs(subs);
-    await _store.saveSettings(settings);
-    await _store.saveSelected(selectedId);
-    notifyListeners();
-    return added;
+    if (j['settings'] is Map) {
+      settings = AppSettings.fromJson(Map<String, dynamic>.from(j['settings'] as Map));
+      await Store.saveSettings(settings);
+    }
+    selectedId ??= profiles.isNotEmpty ? profiles.first.id : null;
+    await Store.saveSubs(subs);
+    await _persist();
+    return n;
   }
 
-  // --------------------------------------------------------------------- ping
+  // ---------- latency / diagnostics ----------
+  List<Profile> _leaves(Profile root) => root.type == ProfileType.group
+      ? [
+          for (final id in root.members)
+            ...profiles.where((p) => p.id == id && p.type != ProfileType.group)
+        ]
+      : [root];
+
+  Future<int> _measure(Profile p) async {
+    try {
+      switch (p.type) {
+        case ProfileType.ssh:
+          final proxy = p.s('proxyHost').trim();
+          return await tcpPing(
+              proxy.isNotEmpty ? proxy : p.s('host').trim(),
+              int.tryParse(proxy.isNotEmpty ? p.s('proxyPort') : p.s('port')) ??
+                  (proxy.isNotEmpty ? 8080 : 22));
+        case ProfileType.v2ray:
+          return await _v2.getServerDelay(config: buildXrayConfig(p, settings), url: _testUrl);
+        case ProfileType.wireguard:
+          return await _v2.getServerDelay(
+              config: buildWireguardConfig(p.s('config'), settings), url: _testUrl);
+        case ProfileType.openvpn:
+          final r = parseOvpnRemote(p.s('config'));
+          if (r == null) return -1;
+          if (r.proto == 'udp') return -3; // UDP cannot be probed with a TCP connect
+          return await tcpPing(r.host, r.port);
+        case ProfileType.chain:
+          final e = byId(p.s('entry')), x = byId(p.s('exit'));
+          if (e == null || x == null) return -1;
+          return await _v2.getServerDelay(config: buildChainConfig(e, x, settings), url: _testUrl);
+        case ProfileType.group:
+          var best = -1;
+          for (final l in _leaves(p)) {
+            final m = await _measure(l);
+            if (m > 0 && (best < 0 || m < best)) best = m;
+          }
+          return best;
+      }
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  Future<void> ping(Profile p) async {
+    if (state != ConnState.disconnected) return;
+    latency[p.id] = -2;
+    notifyListeners();
+    final ms = await _measure(p);
+    latency[p.id] = ms == -3 ? -3 : (ms <= 0 ? -1 : ms);
+    notifyListeners();
+  }
 
   Future<void> pingAll() async {
-    if (busy || pinging) return;
-    pinging = true;
-    pings.clear();
-    notifyListeners();
-    final targets = profiles.where((p) => p.endpoint != null).toList();
-    var next = 0;
-    Future<void> worker() async {
-      while (next < targets.length) {
-        final p = targets[next++];
-        final ep = p.endpoint!;
-        pings[p.id] = await tcpPing(ep.host, ep.port);
-        notifyListeners();
-      }
+    for (final p in List<Profile>.of(profiles)) {
+      if (state != ConnState.disconnected) return;
+      await ping(p);
     }
+  }
 
-    await Future.wait([for (var i = 0; i < 4; i++) worker()]);
-    pinging = false;
+  /// Re-orders a failover group so the lowest-latency server is tried first.
+  Future<void> sortGroupByLatency(Profile g) async {
+    final leaves = _leaves(g);
+    for (final l in leaves) {
+      await ping(l);
+    }
+    final ids = leaves.map((e) => e.id).toList()
+      ..sort((a, b) {
+        int v(String id) {
+          final m = latency[id] ?? -1;
+          return m <= 0 ? 1 << 30 : m;
+        }
+
+        return v(a).compareTo(v(b));
+      });
+    g.data['members'] = ids;
+    await _persist();
+  }
+
+  /// Real HTTPS request through the running tunnel.
+  Future<void> testTunnel() async {
+    if (state != ConnState.connected) return;
+    tunnelDelay = 0;
+    notifyListeners();
+    try {
+      final ms = _active?.type == ProfileType.openvpn
+          ? await _httpProbe()
+          : await _v2.getConnectedServerDelay(url: _testUrl);
+      tunnelDelay = ms <= 0 ? -1 : ms;
+    } catch (_) {
+      tunnelDelay = -1;
+    }
     notifyListeners();
   }
 
-  // --------------------------------------------------------------- connection
-
-  List<Profile> _leaves(Profile p, [Set<String>? seen]) {
-    if (p.type != ProfileType.group) return [p];
-    seen ??= {p.id};
-    final out = <Profile>[];
-    for (final id in (p.data['members'] as List? ?? const [])) {
-      if (!seen.add('$id')) continue;
-      for (final c in profiles) {
-        if (c.id == id) out.addAll(_leaves(c, seen));
-      }
+  /// Plain HTTPS request timing (used where the Xray delay test does not apply).
+  Future<int> _httpProbe() async {
+    final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    final sw = Stopwatch()..start();
+    try {
+      final req = await c.getUrl(Uri.parse(_testUrl));
+      final res = await req.close().timeout(const Duration(seconds: 8));
+      await res.drain<void>();
+      return sw.elapsedMilliseconds;
+    } catch (_) {
+      return -1;
+    } finally {
+      c.close(force: true);
     }
-    return out;
   }
 
+  /// Downloads [AppSettings.speedUrl] through the tunnel for up to 10 s.
+  Future<void> runSpeedTest() async {
+    if (state != ConnState.connected || speedRunning) return;
+    speedRunning = true;
+    speedMbps = 0;
+    speedMsg = '';
+    notifyListeners();
+    try {
+      final uri = Uri.parse(settings.speedUrl.trim());
+      final sw = Stopwatch()..start();
+      var bytes = 0;
+      if (_active?.type == ProfileType.ssh) {
+        if (uri.scheme != 'http') throw 'SSH mode needs an http:// speed-test URL';
+        final path = uri.path.isEmpty ? '/' : uri.path + (uri.hasQuery ? '?${uri.query}' : '');
+        bytes = await _ssh.httpDownload(uri.host, uri.hasPort ? uri.port : 80, path);
+      } else {
+        final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+        try {
+          final req = await c.getUrl(uri);
+          final res = await req.close().timeout(const Duration(seconds: 10));
+          if (res.statusCode != 200) throw 'HTTP ${res.statusCode}';
+          await for (final d in res) {
+            bytes += d.length;
+            if (bytes >= 30 * 1024 * 1024 || sw.elapsed.inSeconds >= 10) break;
+          }
+        } finally {
+          c.close(force: true);
+        }
+      }
+      sw.stop();
+      final secs = max(sw.elapsedMilliseconds, 1) / 1000;
+      speedMbps = bytes * 8 / 1e6 / secs;
+      speedMsg = '${(bytes / 1048576).toStringAsFixed(1)} MB in ${secs.toStringAsFixed(1)} s';
+    } catch (e) {
+      speedMbps = -1;
+      speedMsg = '$e';
+    } finally {
+      speedRunning = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> checkIp() async {
+    if (state != ConnState.connected) return;
+    exitIp = '…';
+    notifyListeners();
+    try {
+      String body;
+      if (_active?.type == ProfileType.ssh) {
+        // This app is excluded from the VPN in SSH mode, so ask through SSH.
+        body = await _ssh.httpGet('api.ipify.org', '/');
+      } else {
+        final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+        try {
+          final req = await c.getUrl(Uri.parse('https://api.ipify.org'));
+          final res = await req.close().timeout(const Duration(seconds: 8));
+          body = await utf8.decodeStream(res);
+        } finally {
+          c.close(force: true);
+        }
+      }
+      final ip = body.trim();
+      exitIp = RegExp(r'^[0-9a-fA-F:.]{3,45}$').hasMatch(ip) ? ip : 'unavailable';
+    } catch (e) {
+      exitIp = 'unavailable';
+    }
+    notifyListeners();
+  }
+
+  Future<String> coreVersion() async {
+    try {
+      return await _v2.getCoreVersion();
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
+  Future<List<String>> coreLogs() async {
+    try {
+      return await _v2.getLogs();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  // ---------- core status ----------
+  void _onV2(V2RayStatus st) {
+    if (_root == null) return;
+    upSpeed = st.uploadSpeed;
+    downSpeed = st.downloadSpeed;
+    upTotal = st.upload;
+    downTotal = st.download;
+    duration = st.duration;
+    _account(st.upload, st.download);
+    switch (st.state.toString().toUpperCase()) {
+      case 'CONNECTED':
+        if (state != ConnState.connected) {
+          state = ConnState.connected;
+          _retries = 0;
+          log('Tunnel up');
+          _startHealth();
+        }
+        final u = _up;
+        if (u != null && !u.isCompleted) u.complete();
+        break;
+      case 'CONNECTING':
+        if (state != ConnState.connected) state = ConnState.connecting;
+        break;
+      case 'DISCONNECTED':
+        if (state == ConnState.connected && !_userStopped) {
+          unawaited(_dropped());
+          return;
+        }
+        break;
+    }
+    notifyListeners();
+  }
+
+  /// Adds the growth since the last status update to the usage log.
+  void _account(int up, int down) {
+    final name = _root?.name;
+    if (name == null) return;
+    usage.add(name, up >= _prevUp ? up - _prevUp : up, down >= _prevDown ? down - _prevDown : down);
+    _prevUp = up;
+    _prevDown = down;
+  }
+
+  // ---------- OpenVPN callbacks ----------
+  void _onOvpnStage(ovpn.VPNStage stage, String raw) {
+    if (_root == null || !_ovpnActive) return;
+    final r = raw.toLowerCase().replaceAll('-', '_');
+    final stageName = stage.toString().toLowerCase();
+    if (stage.isConnected) {
+      if (state != ConnState.connected) {
+        state = ConnState.connected;
+        _retries = 0;
+        log('OpenVPN connected');
+      }
+      final u = _ovpnUp;
+      if (u != null && !u.isCompleted) u.complete();
+    } else if (r.contains('auth_failed') || stageName.contains('auth_failed') ||
+        r.contains('denied') || stageName.contains('denied') ||
+        r.contains('fatal') || stageName.contains('fatal') ||
+        r == 'error' || stageName.endsWith('.error')) {
+      final why = (r.contains('auth_failed') || stageName.contains('auth_failed'))
+          ? 'OpenVPN authentication failed (check username / password / certificate)'
+          : (r.contains('denied') || stageName.contains('denied'))
+              ? 'VPN permission denied'
+              : 'OpenVPN reported a fatal error: $raw';
+      final u = _ovpnUp;
+      if (u != null && !u.isCompleted) {
+        u.completeError(why);
+      } else if (state == ConnState.connected && !_userStopped) {
+        log(why);
+        unawaited(_dropped());
+      }
+    } else if (stage.isDisconnected) {
+      final u = _ovpnUp;
+      if (_ovpnSawConnecting && u != null && !u.isCompleted) {
+        u.completeError('OpenVPN disconnected before the tunnel connected');
+      } else if (state == ConnState.connected && !_userStopped) {
+        unawaited(_dropped());
+      }
+    } else if (stage.isConnecting) {
+      _ovpnSawConnecting = true;
+      if (state != ConnState.connected) state = ConnState.connecting;
+    }
+    notifyListeners();
+  }
+
+  void _onOvpnStatus(ovpn.VpnStatus? s) {
+    if (s == null || _root == null || !_ovpnActive) return;
+    final up = int.tryParse('${s.byteOut}') ?? 0;
+    final down = int.tryParse('${s.byteIn}') ?? 0;
+    upTotal = up;
+    downTotal = down;
+    upSpeed = int.tryParse('${s.speedOut}') ?? 0;
+    downSpeed = int.tryParse('${s.speedIn}') ?? 0;
+    duration = '${s.duration ?? '00:00:00'}';
+    _account(up, down);
+    notifyListeners();
+  }
+
+  void _resetStats() {
+    _prevUp = _prevDown = 0;
+    speedMbps = 0;
+    speedMsg = '';
+    upSpeed = downSpeed = upTotal = downTotal = 0;
+    duration = '00:00:00';
+    exitIp = '';
+    tunnelDelay = 0;
+    _failStreak = 0;
+    _lastCheckDown = -1;
+  }
+
+  // ---------- connect / disconnect ----------
   Future<void> connect() async {
     final p = selected;
     if (p == null || state != ConnState.disconnected) return;
     _root = p;
     _userStopped = false;
     _retries = 0;
-    error = null;
-    final g = ++_gen;
-    await _run(g);
+    _gen++;
+    _resetStats();
+    bumpRotation();
+    await _run(_gen);
   }
 
   Future<void> disconnect() async {
     _userStopped = true;
     _gen++;
     _retryTimer?.cancel();
-    _stopWatch();
-    if (state != ConnState.disconnected) log('Disconnecting');
+    _health?.cancel();
+    log('Disconnecting');
     await _stopCore();
+    unawaited(usage.save());
     _root = null;
-    _resetStats();
+    _active = null;
     state = ConnState.disconnected;
+    _resetStats();
     notifyListeners();
   }
 
-  void _resetStats() {
-    duration = '00:00:00';
-    upSpeed = downSpeed = upTotal = downTotal = 0;
-    lastDelay = null;
-    activeName = '';
-  }
-
-  Future<void> _run(int g) async {
+  Future<void> _run(int gen) async {
     final root = _root;
-    if (root == null) return;
+    if (root == null || gen != _gen) return;
     state = ConnState.connecting;
-    notifyListeners();
-    final leaves = _leaves(root);
-    if (leaves.isEmpty) {
-      error = 'This group has no usable members';
-      log(error!);
-      await disconnect();
-      return;
-    }
-    String? lastErr;
-    for (final leaf in leaves) {
-      if (_userStopped || g != _gen) return;
-      activeName = leaf.name;
-      log('Connecting: ${leaf.name} (${leaf.typeLabel})');
-      notifyListeners();
-      try {
-        await _start(leaf, g);
-        return; // success: _onV2 flips state to connected
-      } catch (e) {
-        lastErr = errText(e);
-        if (_userStopped || g != _gen) return;
-        log('${leaf.name} failed: $lastErr');
-        await _stopCore();
+    log('Connecting: ${root.name} (${typeLabel(root.type)})');
+    try {
+      final leaves = _leaves(root);
+      if (leaves.isEmpty) throw 'Group has no servers';
+      Object? last;
+      for (final leaf in leaves) {
+        if (_userStopped || gen != _gen) return;
+        try {
+          if (leaves.length > 1) log('Trying ${leaf.name}');
+          await _start(leaf);
+          if (gen != _gen) return;
+          _active = leaf;
+          return;
+        } catch (e) {
+          last = e;
+          if (_userStopped || gen != _gen) return;
+          log('${leaf.name} failed: $e');
+          await _stopCore();
+        }
       }
+      throw last ?? 'Connection failed';
+    } catch (e) {
+      if (_userStopped || gen != _gen) return;
+      log('Error: $e');
+      await _retryOrStop();
     }
-    if (_userStopped || g != _gen) return;
-    error = lastErr;
-    await _retryOrStop(g);
   }
 
-  Future<void> _retryOrStop(int g) async {
-    if (g != _gen || _userStopped) return;
-    if (!settings.autoReconnect || _retries >= settings.reconnectMax) {
-      log(settings.autoReconnect ? 'Giving up after $_retries retries' : 'Connection failed');
-      await disconnect();
-      return;
+  Future<void> _retryOrStop() async {
+    if (_userStopped) return;
+    if (settings.autoReconnect && _retries < settings.reconnectMax) {
+      _retries++;
+      final wait = min(2 << _retries, 30);
+      log('Reconnecting in ${wait}s (attempt $_retries/${settings.reconnectMax})');
+      state = ConnState.connecting;
+      notifyListeners();
+      final gen = _gen;
+      _retryTimer?.cancel();
+      _retryTimer = Timer(Duration(seconds: wait), () {
+        if (!_userStopped && gen == _gen) unawaited(_run(gen));
+      });
+    } else {
+      await _stopCore();
+      _root = null;
+      _active = null;
+      state = ConnState.disconnected;
+      _resetStats();
+      notifyListeners();
     }
-    _retries++;
-    final wait = Duration(seconds: (_retries * 3).clamp(3, 20).toInt());
-    log('Retry $_retries/${settings.reconnectMax} in ${wait.inSeconds}s');
-    state = ConnState.connecting;
-    notifyListeners();
-    _retryTimer?.cancel();
-    _retryTimer = Timer(wait, () {
-      if (!_userStopped && g == _gen) _run(g);
-    });
   }
 
-  Future<void> _dropped(int g) async {
-    if (g != _gen || _userStopped || _dropping) return;
+  Future<void> _dropped() async {
+    if (_dropping || _userStopped) return;
     _dropping = true;
     try {
       log('Connection lost');
-      state = ConnState.connecting;
-      _stopWatch();
-      notifyListeners();
+      _health?.cancel();
       await _stopCore();
-      await _retryOrStop(g);
+      await _retryOrStop();
     } finally {
       _dropping = false;
     }
   }
 
-  Future<void> _start(Profile leaf, int g) async {
-    switch (leaf.type) {
-      case ProfileType.ssh:
-        final o = _sshOptions(leaf);
-        ssh.onClosed = (r) {
-          log(r);
-          _dropped(g);
-        };
-        final port = await ssh.start(o, log);
-        final cfg = applyNetwork(buildSocksConfig(port), settings, tcpOnly: true);
-        await _launch(leaf.name, cfg, excludeSelf: true);
-        break;
-      case ProfileType.v2ray:
-        var cfg = buildV2rayConfig(leaf);
-        if (leaf.data['mode'] != 'json') cfg = applyNetwork(cfg, settings);
-        await _launch(leaf.name, cfg);
-        break;
-      case ProfileType.wireguard:
-        await _launch(leaf.name, applyNetwork(buildWireGuardConfig(leaf), settings));
-        break;
-      case ProfileType.group:
-        throw 'Nested group';
-    }
-  }
-
-  SshOptions _sshOptions(Profile p) {
-    final d = p.data;
-    String s(String k) => (d[k] ?? '').toString().trim();
-    final host = s('host');
-    if (host.isEmpty) throw 'SSH host is empty';
-    if (s('user').isEmpty) throw 'SSH username is empty';
-    return SshOptions(
-      host: host,
-      port: int.tryParse(s('port')) ?? 22,
-      user: s('user'),
-      pass: (d['pass'] ?? '').toString(),
-      keyPem: (d['key'] ?? '').toString(),
-      keyPass: (d['keyPass'] ?? '').toString(),
-      payload: (d['payload'] ?? '').toString(),
-      proxyHost: s('proxyHost'),
-      proxyPort: int.tryParse(s('proxyPort')) ?? 8080,
-      useTls: d['tls'] == true,
-      sni: s('sni'),
-      ws: d['ws'] == true,
-      legacy: d['legacy'] != false,
-      verifyHostKey: d['verifyHost'] == true,
-      hostKey: s('hostKey'),
-      onHostKey: (v) {
-        p.data['hostKey'] = v;
-        saveProfiles();
-      },
-      verifyTls: d['verifyTls'] == true,
-      pin: s('pin'),
-      keepAlive: settings.sshKeepAlive,
-      socksPort: settings.socksPort,
-      shareHotspot: settings.shareHotspot,
-    );
-  }
-
-  Future<void> _launch(String remark, String config, {bool excludeSelf = false}) async {
-    final c = Completer<void>();
-    _up = c;
-    if (!await _v2.requestPermission()) throw 'VPN permission was denied';
-    // In SSH mode the SSH socket lives in this app. It must bypass the VPN or
-    // its own traffic would be routed back into the tunnel it carries.
-    final apps = <String>[...settings.blockedApps, if (excludeSelf) kAppId];
-    await _v2.startV2Ray(
-      remark: remark,
-      config: config,
-      blockedApps: apps.isEmpty ? null : apps,
-      bypassSubnets: settings.bypassLan ? lanBypassSubnets : null,
-      proxyOnly: false,
-    );
-    try {
-      await c.future.timeout(const Duration(seconds: 25), onTimeout: () {
-        throw 'Tunnel did not come up within 25s';
-      });
-    } finally {
-      if (identical(_up, c)) _up = null;
-    }
-  }
-
-  void _cancelWait() {
-    final u = _up;
-    _up = null;
-    if (u != null && !u.isCompleted) u.completeError('cancelled');
+  /// Periodic liveness check: catches tunnels that are "connected" but dead
+  /// (network switch, server restart) which the core never reports.
+  void _startHealth() {
+    _health?.cancel();
+    _failStreak = 0;
+    if (!settings.healthCheck) return;
+    _health = Timer.periodic(const Duration(seconds: 45), (_) async {
+      if (state != ConnState.connected || _userStopped || _dropping) return;
+      if (_active?.type == ProfileType.openvpn) return; // the engine has its own keepalive
+      if (_active?.type == ProfileType.ssh && !_ssh.alive) {
+        unawaited(_dropped());
+        return;
+      }
+      // Bytes still arriving means the tunnel is alive; no need to probe.
+      if (_lastCheckDown >= 0 && downTotal > _lastCheckDown) {
+        _lastCheckDown = downTotal;
+        _failStreak = 0;
+        return;
+      }
+      _lastCheckDown = downTotal;
+      var ok = false;
+      try {
+        ok = (await _v2.getConnectedServerDelay(url: _testUrl)) > 0;
+      } catch (_) {}
+      _failStreak = ok ? 0 : _failStreak + 1;
+      if (_failStreak >= 3) {
+        log('Health check failed 3 times, reconnecting');
+        unawaited(_dropped());
+      }
+    });
   }
 
   Future<void> _stopCore() async {
-    _cancelWait();
+    final u = _up;
+    _up = null;
+    if (u != null && !u.isCompleted) u.completeError('stopped');
+    if (_ovpnActive) {
+      _ovpnActive = false;
+      final ou = _ovpnUp;
+      _ovpnUp = null;
+      if (ou != null && !ou.isCompleted) ou.completeError('stopped');
+      try {
+        await _ovpn.disconnect();
+      } catch (_) {}
+    }
     try {
-      await ssh.stop();
+      await _ssh.stop();
     } catch (_) {}
     try {
       await _v2.stopV2Ray();
     } catch (_) {}
   }
 
-  void _onV2(V2RayStatus st) {
-    if (_root == null) return;
-    final s = st.state.toString().toUpperCase();
-    if (s.contains('CONNECTED') && !s.contains('DIS')) {
-      if (state != ConnState.connected) {
-        state = ConnState.connected;
-        _retries = 0;
-        error = null;
-        log('Connected');
-        final u = _up;
-        if (u != null && !u.isCompleted) u.complete();
-        _startWatch(_gen);
-      }
-      duration = st.duration;
-      upSpeed = st.uploadSpeed;
-      downSpeed = st.downloadSpeed;
-      upTotal = st.upload;
-      downTotal = st.download;
-      notifyListeners();
-    } else if (s.contains('DISCONNECTED')) {
-      if (state == ConnState.connected && !_userStopped) {
-        // Stopped from the notification, or another VPN took over.
-        log('VPN stopped outside the app');
-        _gen++;
-        _stopWatch();
-        _stopCore().whenComplete(() {
-          _root = null;
-          _resetStats();
-          state = ConnState.disconnected;
-          notifyListeners();
-        });
-      }
+  Future<void> _start(Profile p) async {
+    switch (p.type) {
+      case ProfileType.ssh:
+        return _startSsh(p);
+      case ProfileType.v2ray:
+        return _launch(p.name, buildXrayConfig(p, settings), ssh: false);
+      case ProfileType.wireguard:
+        return _launch(p.name, buildWireguardConfig(p.s('config'), settings), ssh: false);
+      case ProfileType.openvpn:
+        return _startOpenVpn(p);
+      case ProfileType.chain:
+        final e = byId(p.s('entry')), x = byId(p.s('exit'));
+        if (e == null || x == null) throw 'Chain needs an entry and an exit server';
+        return _launch(p.name, buildChainConfig(e, x, settings), ssh: false);
+      case ProfileType.group:
+        throw 'Nested groups are not supported';
     }
   }
 
-  // ----------------------------------------------------------------- watchdog
-
-  void _startWatch(int g) {
-    _stopWatch();
-    if (!settings.watchdog) return;
-    _watchFails = 0;
-    _watch = Timer.periodic(Duration(seconds: settings.watchdogInterval), (_) async {
-      if (state != ConnState.connected || g != _gen) return;
-      final d = await connectedDelay();
-      if (state != ConnState.connected || g != _gen) return;
-      if (d > 0 && d < 8000) {
-        _watchFails = 0;
-        lastDelay = d;
-        notifyListeners();
-      } else {
-        _watchFails++;
-        log('Health check failed ($_watchFails/${settings.watchdogFails})');
-        if (_watchFails >= settings.watchdogFails) {
-          _watchFails = 0;
-          _dropped(g);
-        }
-      }
-    });
-  }
-
-  void _stopWatch() {
-    _watch?.cancel();
-    _watch = null;
-  }
-
-  /// Round-trip through the running tunnel to the health-check URL, in ms.
-  /// Returns -1 on failure.
-  Future<int> connectedDelay() async {
-    try {
-      return await _v2.getConnectedServerDelay(url: settings.watchdogUrl);
-    } catch (_) {
-      return -1;
+  Future<void> _startOpenVpn(Profile p) async {
+    if (!_ovpnReady) {
+      throw 'OpenVPN engine is unavailable${_ovpnInitError == null ? '' : ': $_ovpnInitError'}';
     }
-  }
-
-  Future<List<String>> coreLogs() async {
+    var cfg = p.s('config');
+    if (cfg.trim().isEmpty) throw 'The OpenVPN config is empty';
+    if (p.b('singleRemote')) cfg = await ovpn.OpenVPN.filteredConfig(cfg) ?? cfg;
+    final up = Completer<void>();
+    unawaited(up.future.catchError((Object _) {}));
+    _ovpnUp = up;
+    _ovpnActive = true;
+    _ovpnSawConnecting = false;
+    final user = p.s('user'), pass = p.s('pass'), kp = p.s('keyPass');
+    final bool started;
     try {
-      final l = await _v2.getLogs();
-      return [for (final e in l) e.toString()];
+      started = await _ovpn.connect(
+        cfg,
+        p.name,
+        username: user.isEmpty ? null : user,
+        password: pass.isEmpty ? null : pass,
+        privateKeyPassword: kp.isEmpty ? null : kp,
+        bypassPackages: settings.blockedApps.isEmpty ? null : settings.blockedApps,
+      );
     } catch (e) {
-      return ['Could not read core logs: ${errText(e)}'];
+      _ovpnActive = false;
+      throw 'OpenVPN: $e';
     }
+    if (!started) {
+      _ovpnActive = false;
+      throw 'VPN permission denied';
+    }
+    await up.future.timeout(const Duration(seconds: 45),
+        onTimeout: () => throw 'OpenVPN did not connect within 45s');
+  }
+
+  Future<bool> Function(String, Uint8List) _verifier(Profile p) => (type, fp) async {
+        final hex = fp.map((b) => b.toRadixString(16).padLeft(2, '0')).join(':');
+        final seen = '$type $hex';
+        final known = _hosts[p.hostKey];
+        if (known == null) {
+          _hosts[p.hostKey] = seen;
+          await Store.saveHosts(_hosts);
+          log('Pinned SSH host key for ${p.hostKey}: $seen');
+          return true;
+        }
+        if (known == seen) return true;
+        log('SSH HOST KEY CHANGED for ${p.hostKey}! Expected $known, got $seen. '
+            'Refusing to connect. If the server was reinstalled, edit the profile and '
+            'tap "Forget pinned host key".');
+        return false;
+      };
+
+  Future<void> _startSsh(Profile p) async {
+    final opts = SshOptions(
+      host: p.s('host').trim(),
+      port: int.tryParse(p.s('port')) ?? 22,
+      user: p.s('user').trim(),
+      pass: p.s('pass'),
+      keyPem: p.s('keyPem'),
+      keyPass: p.s('keyPass'),
+      payload: p.s('payload'),
+      proxyHost: p.s('proxyHost').trim(),
+      proxyPort: int.tryParse(p.s('proxyPort')) ?? 8080,
+      useTls: p.b('tls'),
+      sni: p.s('sni').trim(),
+      allowInsecure: p.data['allowInsecure'] != false,
+      wsFraming: p.b('ws'),
+      keepAlive: settings.sshKeepalive,
+      udpgwPort: (int.tryParse(p.s('udpgwPort')) ?? 0).clamp(0, 65535).toInt(),
+      shareHotspot: settings.shareHotspot,
+      hotspotUser: settings.hotspotUser,
+      hotspotPass: settings.hotspotPass,
+      verifyHostKey: p.data['pinHostKey'] == false ? null : _verifier(p),
+    );
+    if (opts.host.isEmpty || opts.user.isEmpty) throw 'Host and username are required';
+    if (opts.shareHotspot && opts.hotspotUser.isEmpty) {
+      log('Hotspot sharing is ON without a username/password: anyone on the hotspot can use this tunnel');
+    }
+
+    _ssh.onClosed = () {
+      if (!_userStopped && state == ConnState.connected) unawaited(_dropped());
+    };
+    final port = await _ssh.start(opts, log, socksPort: settings.socksPort);
+    await _launch(p.name, buildSocksConfig(port, settings), ssh: true);
+  }
+
+  Future<void> _launch(String remark, String config, {required bool ssh}) async {
+    if (!_v2Ready) {
+      throw 'Xray engine is unavailable${_v2InitError == null ? '' : ': $_v2InitError'}';
+    }
+    final up = Completer<void>();
+    unawaited(up.future.catchError((Object _) {}));
+    _up = up;
+    log('Requesting Android VPN permission');
+    if (!await _v2.requestPermission()) throw 'VPN permission denied';
+    log('VPN permission granted; starting Xray tunnel');
+    // In SSH mode our own sockets (the SSH connection itself) must NOT be routed
+    // into the VPN, or the tunnel will loop into itself.
+    final apps = <String>{...settings.blockedApps, if (ssh) Native.ownPackage}.toList();
+    try {
+      await _v2.startV2Ray(
+        remark: remark,
+        config: config,
+        blockedApps: apps.isEmpty ? null : apps,
+        bypassSubnets: settings.bypassLan ? lanBypassSubnets : null,
+        proxyOnly: false,
+      );
+    } catch (e) {
+      log('Xray startV2Ray failed: $e');
+      rethrow;
+    }
+    try {
+      await up.future.timeout(const Duration(seconds: 25),
+          onTimeout: () => throw 'Tunnel did not come up within 25s');
+    } catch (e) {
+      log('Xray connection did not reach CONNECTED state: $e');
+      rethrow;
+    }
+  }
+
+  @override
+  void dispose() {
+    _usageTimer?.cancel();
+    _retryTimer?.cancel();
+    _health?.cancel();
+    super.dispose();
   }
 }

@@ -1,21 +1,20 @@
 import 'dart:convert';
-
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'app_info.dart';
 
-import 'config_tweaks.dart';
-import 'subscription.dart';
+enum ProfileType { ssh, v2ray, wireguard, group }
 
-enum ProfileType { ssh, v2ray, wireguard, openvpn, chain, group }
+int _idCounter = 0;
+String newId() =>
+    '${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}${(_idCounter++).toRadixString(36)}';
 
-String typeLabel(ProfileType t) => switch (t) {
-      ProfileType.ssh => 'SSH Tunnel',
-      ProfileType.v2ray => 'V2Ray / Xray / Hysteria2',
-      ProfileType.wireguard => 'WireGuard',
-      ProfileType.openvpn => 'OpenVPN',
-      ProfileType.chain => 'Proxy Chain (entry → exit)',
-      ProfileType.group => 'Failover Group',
-    };
+String decodeB64(String s) {
+  var t = s.trim().replaceAll('-', '+').replaceAll('_', '/');
+  while (t.length % 4 != 0) {
+    t += '=';
+  }
+  return utf8.decode(base64.decode(t), allowMalformed: true);
+}
 
 class Profile {
   Profile({
@@ -23,164 +22,205 @@ class Profile {
     required this.name,
     required this.type,
     Map<String, dynamic>? data,
-  }) : data = data ?? {};
+    this.subId,
+  }) : data = data ?? <String, dynamic>{};
 
-  final String id;
+  String id;
   String name;
   ProfileType type;
   Map<String, dynamic> data;
 
-  String s(String k) => (data[k] ?? '').toString();
-  bool b(String k) => data[k] == true;
-  List<String> get members =>
-      ((data['members'] as List?) ?? const []).map((e) => e.toString()).toList();
+  /// Set when this profile was created by a subscription refresh.
+  String? subId;
 
-  /// Id of the subscription this profile came from ('' = created by hand).
-  String get subId => s('sub');
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'type': type.name,
+        'data': data,
+        if (subId != null) 'sub': subId,
+      };
 
-  /// Optional IP/host to dial instead of the profile's own address.
-  String get connectAddr => s('connectAddr').trim();
+  factory Profile.fromJson(Map<String, dynamic> j) => Profile(
+        id: (j['id'] ?? newId()).toString(),
+        name: (j['name'] ?? 'Profile').toString(),
+        type: ProfileType.values.firstWhere(
+          (t) => t.name == j['type'],
+          orElse: () => ProfileType.v2ray,
+        ),
+        data: Map<String, dynamic>.from((j['data'] as Map?) ?? {}),
+        subId: j['sub']?.toString(),
+      );
 
-  /// Host:port that identifies the SSH server (key pinning, latency tests).
-  String get hostKey => '${s('host').trim()}:${s('port').isEmpty ? '22' : s('port')}';
+  String get typeLabel => switch (type) {
+        ProfileType.ssh => 'SSH',
+        ProfileType.v2ray => _v2Label(),
+        ProfileType.wireguard => 'WireGuard',
+        ProfileType.group => 'Group',
+      };
 
-  String get subtitle {
-    switch (type) {
-      case ProfileType.ssh:
-        final extra = <String>[
-          if (b('tls')) 'TLS/SNI',
-          if (s('proxyHost').isNotEmpty) 'proxy',
-          if (s('payload').isNotEmpty) 'payload',
-          if (b('ws')) 'WS',
-          if ((int.tryParse(s('udpgwPort')) ?? 0) > 0) 'UDP',
-        ].join(' + ');
-        return 'SSH ${s('host')}:${s('port')}${extra.isEmpty ? '' : '  ·  $extra'}';
-      case ProfileType.v2ray:
-        switch (s('mode')) {
-          case 'json':
-            return 'Raw Xray JSON';
-          case 'link':
-            return s('link').split('://').first.toUpperCase();
-          default:
-            return '${s('proto').toUpperCase()} ${s('address')}:${s('port')}  ·  ${s('network')}/${s('security')}';
-        }
-      case ProfileType.wireguard:
-        return 'WireGuard';
-      case ProfileType.openvpn:
-        final r = parseOvpnRemote(s('config'));
-        return r == null ? 'OpenVPN' : 'OpenVPN ${r.host}:${r.port} ${r.proto.toUpperCase()}';
-      case ProfileType.chain:
-        return 'Chain of 2 servers';
-      case ProfileType.group:
-        return '${members.length} servers, tried in order';
+  String _v2Label() {
+    final l = (data['link'] ?? '').toString();
+    final i = l.indexOf('://');
+    if (data['mode'] == 'json') return 'Xray JSON';
+    if (i > 0) return l.substring(0, i).toUpperCase();
+    final p = (data['proto'] ?? '').toString();
+    return p.isEmpty ? 'Xray' : p.toUpperCase();
+  }
+
+  /// First-hop endpoint used for TCP latency tests. Null when unknown.
+  ({String host, int port})? get endpoint {
+    try {
+      switch (type) {
+        case ProfileType.ssh:
+          final ph = (data['proxyHost'] ?? '').toString();
+          if (ph.isNotEmpty) {
+            return (host: ph, port: int.parse('${data['proxyPort'] ?? 8080}'));
+          }
+          final h = (data['host'] ?? '').toString();
+          if (h.isEmpty) return null;
+          return (host: h, port: int.parse('${data['port'] ?? 22}'));
+        case ProfileType.v2ray:
+          if (data['mode'] == 'json') return _jsonEndpoint('${data['json'] ?? ''}');
+          if (data['mode'] == 'gui') {
+            final a = '${data['address'] ?? ''}';
+            if (a.isEmpty) return null;
+            return (host: a, port: int.parse('${data['port'] ?? 443}'));
+          }
+          return linkEndpoint('${data['link'] ?? ''}');
+        case ProfileType.wireguard:
+          final m = RegExp(r'^\s*Endpoint\s*=\s*(.+?)\s*$', multiLine: true, caseSensitive: false)
+              .firstMatch('${data['conf'] ?? ''}');
+          if (m == null) return null;
+          final v = m.group(1)!;
+          final i = v.lastIndexOf(':');
+          if (i < 0) return null;
+          return (
+            host: v.substring(0, i).replaceAll(RegExp(r'[\[\]]'), ''),
+            port: int.parse(v.substring(i + 1)),
+          );
+        case ProfileType.group:
+          return null;
+      }
+    } catch (_) {
+      return null;
     }
   }
 
-  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'type': type.name, 'data': data};
+  static ({String host, int port})? _jsonEndpoint(String src) {
+    try {
+      final m = jsonDecode(src) as Map;
+      final o = (m['outbounds'] as List).first as Map;
+      final s = o['settings'] as Map;
+      final n = ((s['vnext'] ?? s['servers']) as List).first as Map;
+      return (host: '${n['address']}', port: int.parse('${n['port']}'));
+    } catch (_) {
+      return null;
+    }
+  }
 
-  factory Profile.fromJson(Map<String, dynamic> j) => Profile(
-        id: j['id'] as String,
-        name: (j['name'] ?? 'Profile') as String,
-        type: ProfileType.values
-            .firstWhere((t) => t.name == j['type'], orElse: () => ProfileType.ssh),
-        data: Map<String, dynamic>.from(j['data'] ?? {}),
+  static ({String host, int port})? linkEndpoint(String link) {
+    try {
+      final l = link.trim();
+      if (l.startsWith('vmess://')) {
+        final j = jsonDecode(decodeB64(l.substring(8))) as Map;
+        return (host: '${j['add']}', port: int.parse('${j['port']}'));
+      }
+      var u = Uri.parse(l);
+      if (u.host.isEmpty && l.startsWith('ss://')) {
+        var body = l.substring(5);
+        final h = body.indexOf('#');
+        if (h >= 0) body = body.substring(0, h);
+        final d = decodeB64(body);
+        u = Uri.parse('ss://$d');
+      }
+      if (u.host.isEmpty || !u.hasPort) return null;
+      return (host: u.host, port: u.port);
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+class Subscription {
+  Subscription({required this.id, required this.name, required this.url, this.updated});
+  String id;
+  String name;
+  String url;
+  DateTime? updated;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'url': url,
+        if (updated != null) 'updated': updated!.toIso8601String(),
+      };
+
+  factory Subscription.fromJson(Map<String, dynamic> j) => Subscription(
+        id: (j['id'] ?? newId()).toString(),
+        name: (j['name'] ?? 'Subscription').toString(),
+        url: (j['url'] ?? '').toString(),
+        updated: DateTime.tryParse('${j['updated']}'),
       );
 }
 
-String _safeDecode(String s) {
-  try {
-    return Uri.decodeComponent(s);
-  } catch (_) {
-    return s;
-  }
-}
-
-int _idCounter = 0;
-String newId() => '${DateTime.now().microsecondsSinceEpoch}_${_idCounter++}';
-
-/// Turns pasted text into a profile: our own JSON export, a standard share link,
-/// an ssh:// URL, or a wg-quick config. Returns null if not recognised.
-Profile? importProfile(String raw, {String? id}) {
-  final t = raw.trim();
-  if (t.isEmpty) return null;
-  id ??= newId();
-  if (t.startsWith('{')) {
-    try {
-      final j = jsonDecode(t) as Map<String, dynamic>;
-      if (j.containsKey('type') && j.containsKey('data')) {
-        return Profile.fromJson({...j, 'id': id});
-      }
-      if (j.containsKey('outbounds')) {
-        return Profile(
-            id: id, name: 'Xray JSON', type: ProfileType.v2ray, data: {'mode': 'json', 'json': t});
-      }
-    } catch (_) {}
-    return null;
-  }
-  if (looksLikeOvpn(t)) {
-    return Profile(id: id, name: 'OpenVPN', type: ProfileType.openvpn, data: {'config': t});
-  }
-  if (t.contains('[Interface]')) {
-    return Profile(id: id, name: 'WireGuard', type: ProfileType.wireguard, data: {'config': t});
-  }
-  final scheme = t.split('://').first.toLowerCase();
-  if (!t.contains('://') || !shareSchemes.contains(scheme)) return null;
-  if (scheme == 'ssh') {
-    final u = Uri.tryParse(t);
-    if (u == null || u.host.isEmpty) return null;
-    final ui = u.userInfo.split(':');
-    return Profile(id: id, name: u.fragment.isNotEmpty ? _safeDecode(u.fragment) : u.host, type: ProfileType.ssh, data: {
-      'host': u.host,
-      'port': (u.hasPort ? u.port : 22).toString(),
-      'user': Uri.decodeComponent(ui.first),
-      'pass': ui.length > 1 ? Uri.decodeComponent(ui.sublist(1).join(':')) : '',
-      'udpgwPort': '7300',
-    });
-  }
-  return Profile(
-      id: id, name: shareLinkName(t), type: ProfileType.v2ray, data: {'mode': 'link', 'link': t});
-}
-
 class AppSettings {
-  String dnsPreset = 'default'; // default|google|cloudflare|quad9|adguard|custom
+  String dnsPreset = 'default';
   String dns1 = '';
   String dns2 = '';
   String fallbackDns = '';
+  bool dnsIpv4Only = true;
+
   bool autoReconnect = true;
   int reconnectMax = 5;
-  bool healthCheck = true;
   bool autoConnect = false;
-  bool bypassLan = false;
+  bool bypassLan = true;
   String bypassApps = '';
+
+  bool watchdog = true;
+  String watchdogUrl = 'https://www.gstatic.com/generate_204';
+  int watchdogInterval = 45;
+  int watchdogFails = 3;
+
+  int socksPort = kDefaultSocksPort;
   bool shareHotspot = false;
-  String hotspotUser = '';
-  String hotspotPass = '';
-  int socksPort = 10808;
-  int sshKeepalive = 20;
-  String themeMode = 'system'; // system|light|dark
-  bool fragment = false;
-  String fragLength = '100-200';
-  String fragInterval = '10-20';
-  bool mux = false;
-  int muxConcurrency = 8;
-  String fingerprint = 'default'; // default|chrome|firefox|safari|ios|android|edge|randomized
-  bool blockQuic = false;
-  bool autoUpdateSubs = true;
-  String speedUrl = 'http://speedtest.tele2.net/10MB.zip';
+  int sshKeepAlive = 15;
 
-  List<String> get blockedApps =>
-      bypassApps.split(RegExp(r'[\s,;]+')).where((e) => e.contains('.')).toSet().toList();
+  String themeMode = 'dark';
 
-  List<String> get dnsServers {
-    final base = switch (dnsPreset) {
-      'google' => ['8.8.8.8', '8.8.4.4'],
-      'cloudflare' => ['1.1.1.1', '1.0.0.1'],
-      'quad9' => ['9.9.9.9', '149.112.112.112'],
-      'adguard' => ['94.140.14.14', '94.140.15.15'],
-      'custom' => [dns1, dns2],
-      _ => <String>[],
-    };
-    return [...base, fallbackDns].map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  static const presets = <String, List<String>>{
+    'google': ['8.8.8.8', '8.8.4.4'],
+    'cloudflare': ['1.1.1.1', '1.0.0.1'],
+    'quad9': ['9.9.9.9', '149.112.112.112'],
+    'adguard': ['94.140.14.14', '94.140.15.15'],
+    'opendns': ['208.67.222.222', '208.67.220.220'],
+  };
+
+  List<String> get blockedApps => bypassApps
+      .split(RegExp(r'[\s,;]+'))
+      .map((e) => e.trim())
+      .where((e) => e.contains('.'))
+      .toSet()
+      .toList();
+
+  /// Resolver list for the core. In SSH mode UDP cannot be tunnelled, so plain
+  /// IPs are turned into tcp:// resolvers that ride the SOCKS/SSH channel.
+  List<String> dnsServers({required bool tcp}) {
+    final raw = <String>[];
+    if (dnsPreset == 'custom') {
+      raw.addAll([dns1, dns2]);
+    } else if (presets.containsKey(dnsPreset)) {
+      raw.addAll(presets[dnsPreset]!);
+    }
+    if (fallbackDns.trim().isNotEmpty) raw.add(fallbackDns);
+    final out = <String>[];
+    for (var s in raw.map((e) => e.trim()).where((e) => e.isNotEmpty)) {
+      if (tcp && !s.contains('://')) {
+        s = s.contains(':') ? 'tcp://[$s]' : 'tcp://$s';
+      }
+      if (!out.contains(s)) out.add(s);
+    }
+    return out;
   }
 
   Map<String, dynamic> toJson() => {
@@ -188,151 +228,169 @@ class AppSettings {
         'dns1': dns1,
         'dns2': dns2,
         'fallbackDns': fallbackDns,
+        'dnsIpv4Only': dnsIpv4Only,
         'autoReconnect': autoReconnect,
         'reconnectMax': reconnectMax,
-        'healthCheck': healthCheck,
         'autoConnect': autoConnect,
         'bypassLan': bypassLan,
         'bypassApps': bypassApps,
-        'shareHotspot': shareHotspot,
-        'hotspotUser': hotspotUser,
-        'hotspotPass': hotspotPass,
+        'watchdog': watchdog,
+        'watchdogUrl': watchdogUrl,
+        'watchdogInterval': watchdogInterval,
+        'watchdogFails': watchdogFails,
         'socksPort': socksPort,
-        'sshKeepalive': sshKeepalive,
+        'shareHotspot': shareHotspot,
+        'sshKeepAlive': sshKeepAlive,
         'themeMode': themeMode,
-        'fragment': fragment,
-        'fragLength': fragLength,
-        'fragInterval': fragInterval,
-        'mux': mux,
-        'muxConcurrency': muxConcurrency,
-        'fingerprint': fingerprint,
-        'blockQuic': blockQuic,
-        'autoUpdateSubs': autoUpdateSubs,
-        'speedUrl': speedUrl,
       };
 
-  static AppSettings fromJson(Map<String, dynamic> j) => AppSettings()
-    ..dnsPreset = j['dnsPreset'] ?? 'default'
-    ..dns1 = j['dns1'] ?? ''
-    ..dns2 = j['dns2'] ?? ''
-    ..fallbackDns = j['fallbackDns'] ?? ''
-    ..autoReconnect = j['autoReconnect'] ?? true
-    ..reconnectMax = j['reconnectMax'] ?? 5
-    ..healthCheck = j['healthCheck'] ?? true
-    ..autoConnect = j['autoConnect'] ?? false
-    ..bypassLan = j['bypassLan'] ?? false
-    ..bypassApps = j['bypassApps'] ?? ''
-    ..shareHotspot = j['shareHotspot'] ?? false
-    ..hotspotUser = j['hotspotUser'] ?? ''
-    ..hotspotPass = j['hotspotPass'] ?? ''
-    ..socksPort = j['socksPort'] ?? 10808
-    ..sshKeepalive = j['sshKeepalive'] ?? 20
-    ..themeMode = j['themeMode'] ?? 'system'
-    ..fragment = j['fragment'] ?? false
-    ..fragLength = j['fragLength'] ?? '100-200'
-    ..fragInterval = j['fragInterval'] ?? '10-20'
-    ..mux = j['mux'] ?? false
-    ..muxConcurrency = j['muxConcurrency'] ?? 8
-    ..fingerprint = j['fingerprint'] ?? 'default'
-    ..blockQuic = j['blockQuic'] ?? false
-    ..autoUpdateSubs = j['autoUpdateSubs'] ?? true
-    ..speedUrl = j['speedUrl'] ?? 'http://speedtest.tele2.net/10MB.zip';
+  void applyJson(Map<String, dynamic> j) {
+    String s(String k, String d) => (j[k] ?? d).toString();
+    bool b(String k, bool d) => j[k] is bool ? j[k] as bool : d;
+    int n(String k, int d) => int.tryParse('${j[k]}') ?? d;
+    dnsPreset = s('dnsPreset', dnsPreset);
+    dns1 = s('dns1', dns1);
+    dns2 = s('dns2', dns2);
+    fallbackDns = s('fallbackDns', fallbackDns);
+    dnsIpv4Only = b('dnsIpv4Only', dnsIpv4Only);
+    autoReconnect = b('autoReconnect', autoReconnect);
+    reconnectMax = n('reconnectMax', reconnectMax).clamp(0, 50).toInt();
+    autoConnect = b('autoConnect', autoConnect);
+    bypassLan = b('bypassLan', bypassLan);
+    bypassApps = s('bypassApps', bypassApps);
+    watchdog = b('watchdog', watchdog);
+    watchdogUrl = s('watchdogUrl', watchdogUrl);
+    watchdogInterval = n('watchdogInterval', watchdogInterval).clamp(15, 300).toInt();
+    watchdogFails = n('watchdogFails', watchdogFails).clamp(1, 10).toInt();
+    socksPort = n('socksPort', socksPort);
+    if (socksPort < 1024 || socksPort > 65535 || socksPort == kReservedPort) {
+      socksPort = kDefaultSocksPort;
+    }
+    shareHotspot = b('shareHotspot', shareHotspot);
+    sshKeepAlive = n('sshKeepAlive', sshKeepAlive).clamp(5, 120).toInt();
+    themeMode = s('themeMode', themeMode);
+  }
 }
 
-/// Profiles (which hold passwords / keys), subscription URLs (often contain
-/// tokens) and pinned SSH host keys live in the Android Keystore-backed secure
-/// storage. Plain preferences only hold non-sensitive UI state.
 class Store {
-  static const _kP = 'profiles_v2';
-  static const _kS = 'selected_v2';
-  static const _kSet = 'settings_v2';
+  static const _kProfiles = 'profiles_v3';
+  static const _kSettings = 'settings_v3';
   static const _kSubs = 'subs_v1';
-  static const _kHosts = 'known_hosts_v1';
-  static const _sec = FlutterSecureStorage();
+  static const _kSelected = 'selected_v3';
 
-  static Future<String?> _secRead(String k) async {
+  late SharedPreferences _p;
+
+  Future<void> init() async => _p = await SharedPreferences.getInstance();
+
+  List<Profile> loadProfiles() {
     try {
-      return await _sec.read(key: k);
+      final l = jsonDecode(_p.getString(_kProfiles) ?? '[]') as List;
+      return [for (final e in l) Profile.fromJson(Map<String, dynamic>.from(e as Map))];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  List<Subscription> loadSubs() {
+    try {
+      final l = jsonDecode(_p.getString(_kSubs) ?? '[]') as List;
+      return [for (final e in l) Subscription.fromJson(Map<String, dynamic>.from(e as Map))];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  AppSettings loadSettings() {
+    final s = AppSettings();
+    try {
+      s.applyJson(Map<String, dynamic>.from(jsonDecode(_p.getString(_kSettings) ?? '{}') as Map));
+    } catch (_) {}
+    return s;
+  }
+
+  String? loadSelected() => _p.getString(_kSelected);
+
+  Future<void> saveProfiles(List<Profile> l) =>
+      _p.setString(_kProfiles, jsonEncode([for (final e in l) e.toJson()]));
+  Future<void> saveSubs(List<Subscription> l) =>
+      _p.setString(_kSubs, jsonEncode([for (final e in l) e.toJson()]));
+  Future<void> saveSettings(AppSettings s) => _p.setString(_kSettings, jsonEncode(s.toJson()));
+  Future<void> saveSelected(String? id) =>
+      id == null ? _p.remove(_kSelected) : _p.setString(_kSelected, id);
+}
+
+String _fragName(Uri u, String fallback) {
+  if (u.fragment.isEmpty) return fallback;
+  try {
+    return Uri.decodeComponent(u.fragment);
+  } catch (_) {
+    return u.fragment;
+  }
+}
+
+/// Turns pasted text (share link, ssh:// URI, WireGuard conf, Xray JSON) into a
+/// profile. Returns null when the text is not recognised.
+Profile? importProfile(String raw) {
+  final t = raw.trim();
+  if (t.isEmpty) return null;
+
+  if (t.contains('[Interface]') && t.contains('[Peer]')) {
+    return Profile(id: newId(), name: 'WireGuard', type: ProfileType.wireguard, data: {'conf': t});
+  }
+  if (t.startsWith('{')) {
+    try {
+      jsonDecode(t);
+      return Profile(
+        id: newId(),
+        name: 'Xray JSON',
+        type: ProfileType.v2ray,
+        data: {'mode': 'json', 'json': t},
+      );
     } catch (_) {
       return null;
     }
   }
 
-  static Future<void> _secWrite(String k, String v) async {
-    try {
-      await _sec.write(key: k, value: v);
-    } catch (_) {}
-  }
+  final i = t.indexOf('://');
+  if (i <= 0) return null;
+  final scheme = t.substring(0, i).toLowerCase();
 
-  static Future<List<Profile>> loadProfiles() async {
-    var raw = await _secRead(_kP);
-    if (raw == null) {
-      // one-time migration from the old plaintext SharedPreferences store
-      final p = await SharedPreferences.getInstance();
-      raw = p.getString(_kP);
-      if (raw != null) {
-        await _secWrite(_kP, raw);
-        await p.remove(_kP);
-      }
-    }
-    if (raw == null) return [];
+  if (scheme == 'ssh') {
     try {
-      return (jsonDecode(raw) as List)
-          .map((e) => Profile.fromJson(Map<String, dynamic>.from(e)))
-          .toList();
+      final u = Uri.parse(t);
+      final ui = u.userInfo.split(':');
+      return Profile(
+        id: newId(),
+        name: _fragName(u, u.host),
+        type: ProfileType.ssh,
+        data: {
+          'host': u.host,
+          'port': u.hasPort ? u.port : 22,
+          'user': Uri.decodeComponent(ui.first),
+          'pass': ui.length > 1 ? Uri.decodeComponent(ui.sublist(1).join(':')) : '',
+        },
+      );
     } catch (_) {
-      return [];
+      return null;
     }
   }
 
-  static Future<void> saveProfiles(List<Profile> l) =>
-      _secWrite(_kP, jsonEncode(l.map((e) => e.toJson()).toList()));
+  const v2 = {'vmess', 'vless', 'trojan', 'ss', 'hysteria2', 'hy2', 'hysteria', 'socks'};
+  if (!v2.contains(scheme)) return null;
 
-  static Future<List<Subscription>> loadSubs() async {
-    final raw = await _secRead(_kSubs);
-    if (raw == null) return [];
-    try {
-      return (jsonDecode(raw) as List)
-          .map((e) => Subscription.fromJson(Map<String, dynamic>.from(e)))
-          .toList();
-    } catch (_) {
-      return [];
+  var name = scheme.toUpperCase();
+  try {
+    if (scheme == 'vmess') {
+      final j = jsonDecode(decodeB64(t.substring(8))) as Map;
+      name = (j['ps'] ?? name).toString();
+    } else {
+      name = _fragName(Uri.parse(t), name);
     }
-  }
-
-  static Future<void> saveSubs(List<Subscription> l) =>
-      _secWrite(_kSubs, jsonEncode(l.map((e) => e.toJson()).toList()));
-
-  static Future<Map<String, String>> loadHosts() async {
-    final raw = await _secRead(_kHosts);
-    if (raw == null) return {};
-    try {
-      return Map<String, String>.from(jsonDecode(raw) as Map);
-    } catch (_) {
-      return {};
-    }
-  }
-
-  static Future<void> saveHosts(Map<String, String> m) => _secWrite(_kHosts, jsonEncode(m));
-
-  static Future<String?> loadSelected() async =>
-      (await SharedPreferences.getInstance()).getString(_kS);
-
-  static Future<void> saveSelected(String? id) async {
-    final p = await SharedPreferences.getInstance();
-    id == null ? await p.remove(_kS) : await p.setString(_kS, id);
-  }
-
-  static Future<AppSettings> loadSettings() async {
-    final raw = (await SharedPreferences.getInstance()).getString(_kSet);
-    if (raw == null) return AppSettings();
-    try {
-      return AppSettings.fromJson(jsonDecode(raw) as Map<String, dynamic>);
-    } catch (_) {
-      return AppSettings();
-    }
-  }
-
-  static Future<void> saveSettings(AppSettings s) async =>
-      (await SharedPreferences.getInstance()).setString(_kSet, jsonEncode(s.toJson()));
+  } catch (_) {}
+  return Profile(
+    id: newId(),
+    name: name.isEmpty ? scheme.toUpperCase() : name,
+    type: ProfileType.v2ray,
+    data: {'mode': 'link', 'link': t},
+  );
 }

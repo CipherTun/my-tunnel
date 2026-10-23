@@ -4,18 +4,11 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:dartssh2/dartssh2.dart';
+import 'package:flutter/foundation.dart' show compute;
 
-import 'bytebuf.dart';
-import 'udpgw.dart';
-
-typedef Log = void Function(String message);
-
-final Random _rng = Random.secure();
-int _rotateCounter = 0;
-
-/// Called once per user-initiated connect so [rotate=...] advances.
-void bumpRotation() => _rotateCounter++;
+typedef LogFn = void Function(String message);
 
 class SshOptions {
   SshOptions({
@@ -30,14 +23,16 @@ class SshOptions {
     this.proxyPort = 8080,
     this.useTls = false,
     this.sni = '',
-    this.allowInsecure = true,
-    this.wsFraming = false,
-    this.keepAlive = 20,
-    this.udpgwPort = 0,
+    this.ws = false,
+    this.legacy = true,
+    this.verifyHostKey = false,
+    this.hostKey = '',
+    this.onHostKey,
+    this.verifyTls = false,
+    this.pin = '',
+    this.keepAlive = 15,
+    this.socksPort = 10808,
     this.shareHotspot = false,
-    this.hotspotUser = '',
-    this.hotspotPass = '',
-    this.verifyHostKey,
   });
 
   final String host;
@@ -51,98 +46,121 @@ class SshOptions {
   final int proxyPort;
   final bool useTls;
   final String sni;
-
-  /// Accept any TLS certificate for the SNI/TLS wrapper (normal for domain
-  /// fronting, where the certificate never matches the SNI).
-  final bool allowInsecure;
-  final bool wsFraming;
+  final bool ws;
+  final bool legacy;
+  final bool verifyHostKey;
+  final String hostKey;
+  final void Function(String)? onHostKey;
+  final bool verifyTls;
+  final String pin;
   final int keepAlive;
-
-  /// Port of `badvpn-udpgw` on the SSH server (usually 7300). 0 = UDP off.
-  final int udpgwPort;
+  final int socksPort;
   final bool shareHotspot;
-  final String hotspotUser;
-  final String hotspotPass;
-
-  /// Host-key check (trust-on-first-use pinning is implemented by the caller).
-  final SSHHostkeyVerifyHandler? verifyHostKey;
 }
 
-/// [random=a,b,c] picks one at random, [rotate=a,b,c] advances per connection.
-String expandRandomRotate(String s) {
-  List<String> opts(String raw) =>
-      raw.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-  s = s.replaceAllMapped(RegExp(r'\[random=([^\]]*)\]'), (m) {
-    final o = opts(m[1]!);
-    return o.isEmpty ? '' : o[_rng.nextInt(o.length)];
-  });
-  s = s.replaceAllMapped(RegExp(r'\[rotate=([^\]]*)\]'), (m) {
-    final o = opts(m[1]!);
-    return o.isEmpty ? '' : o[_rotateCounter % o.length];
-  });
-  return s;
+// ---------------------------------------------------------------- byte queue
+
+class _ByteQueue {
+  Uint8List _b = Uint8List(4096);
+  int _s = 0;
+  int _e = 0;
+
+  int get length => _e - _s;
+  int operator [](int i) => _b[_s + i];
+
+  void add(List<int> d) {
+    if (_e + d.length > _b.length) {
+      final len = length;
+      if (_s > 0 && len + d.length <= _b.length) {
+        _b.setRange(0, len, _b, _s);
+      } else {
+        final nb = Uint8List(max(_b.length * 2, len + d.length));
+        nb.setRange(0, len, _b, _s);
+        _b = nb;
+      }
+      _s = 0;
+      _e = len;
+    }
+    _b.setRange(_e, _e + d.length, d);
+    _e += d.length;
+  }
+
+  Uint8List peek(int n) => Uint8List.sublistView(_b, _s, _s + n);
+
+  Uint8List take(int n) {
+    final r = Uint8List.fromList(Uint8List.sublistView(_b, _s, _s + n));
+    skip(n);
+    return r;
+  }
+
+  void skip(int n) {
+    _s += n;
+    if (_s >= _e) {
+      _s = 0;
+      _e = 0;
+    }
+  }
+
+  int indexOfCrlfCrlf() {
+    for (var i = 0; i + 3 < length; i++) {
+      if (_b[_s + i] == 13 && _b[_s + i + 1] == 10 && _b[_s + i + 2] == 13 && _b[_s + i + 3] == 10) {
+        return i;
+      }
+    }
+    return -1;
+  }
 }
 
-/// Tokens: [crlf] [cr] [lf] [host] [port] [host_port] [protocol] [ua] [netData]
-/// [random=a,b] [rotate=a,b]; [split] / [delay_split] / [instant_split]
-/// break the payload into separately sent packets.
-List<String> buildPayload(String template, {required String host, required int port}) {
-  return expandRandomRotate(template)
-      .split(RegExp(r'\[(?:delay_|instant_)?split\]'))
-      .map((chunk) => chunk
-          .replaceAll('[crlf]', '\r\n')
-          .replaceAll('[cr]', '\r')
-          .replaceAll('[lf]', '\n')
-          .replaceAll('[host_port]', '$host:$port')
-          .replaceAll('[host]', host)
-          .replaceAll('[port]', '$port')
-          .replaceAll('[protocol]', 'HTTP/1.1')
-          .replaceAll('[ua]', 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36')
-          .replaceAll('[netData]', 'CONNECT $host:$port HTTP/1.1')
-          .replaceAll(r'\r', '\r')
-          .replaceAll(r'\n', '\n'))
-      .where((c) => c.isNotEmpty)
-      .toList();
-}
+// ------------------------------------------------------------ tunnel socket
 
-/// Transport that can send a payload, strip the HTTP reply, optionally speak
-/// WebSocket framing, then hand a clean byte stream to the SSH client.
+/// A transport for the SSH client. It optionally strips HTTP responses that a
+/// payload/proxy produces before the SSH banner, and optionally speaks
+/// WebSocket framing (client frames masked, server frames parsed).
 class TunnelSocket implements SSHSocket {
-  TunnelSocket(this._socket, {required bool expectHeader, bool ws = false})
-      : _pass = !expectHeader,
-        _ws = ws {
-    _framed = _FramedSink(_socket);
-    _socket.listen(
+  TunnelSocket(this._socket, {required bool expectHeader, required this.ws}) {
+    _pass = !expectHeader;
+    if (expectHeader) _head = Completer<String>();
+    _sub = _socket.listen(
       _onData,
-      onError: (Object e) {
-        if (!_in.isClosed) _in.addError(e);
-        final h = _head;
-        if (h != null && !h.isCompleted) h.completeError(e);
-      },
-      onDone: () {
-        if (!_in.isClosed) _in.close();
-        final h = _head;
-        if (h != null && !h.isCompleted) h.completeError('Connection closed by server');
-      },
+      onError: (Object e, StackTrace s) => _fail(e),
+      onDone: _onDone,
+      cancelOnError: true,
     );
+    if (ws) _framed = _FramedSink(this);
   }
 
   final Socket _socket;
-  final bool _ws;
-  late final _FramedSink _framed;
+  final bool ws;
+  late final StreamSubscription<Uint8List> _sub;
   final StreamController<Uint8List> _in = StreamController<Uint8List>();
-  final ByteBuf _buf = ByteBuf();
-  final ByteBuf _wsBuf = ByteBuf();
+  final _ByteQueue _hq = _ByteQueue();
+  final _ByteQueue _wq = _ByteQueue();
+  final Random _rng = Random.secure();
   Completer<String>? _head;
-  bool _pass;
+  _FramedSink? _framed;
+  bool _pass = false;
+  bool _closed = false;
+  int _skipBody = 0;
+  int _headers = 0;
 
-  void _deliver(Uint8List d) {
-    if (!_ws) {
-      _in.add(d);
-      return;
+  Future<String> awaitHeader(Duration t) => _head!.future.timeout(t, onTimeout: () {
+        throw 'No response to payload within ${t.inSeconds}s';
+      });
+
+  void _fail(Object e) {
+    if (_head != null && !_head!.isCompleted) _head!.completeError(e);
+    if (!_in.isClosed) {
+      _in.addError(e);
+      _in.close();
     }
-    _wsBuf.add(d);
-    _parseFrames();
+  }
+
+  void _onDone() {
+    _closed = true;
+    if (_head != null && !_head!.isCompleted) {
+      _head!.completeError('Connection closed before any response');
+    }
+    if (!_in.isClosed) _in.close();
   }
 
   void _onData(Uint8List d) {
@@ -150,763 +168,644 @@ class TunnelSocket implements SSHSocket {
       _deliver(d);
       return;
     }
-    _buf.add(d);
-    final h = _head;
-    if (h == null || h.isCompleted) return;
-
-    if (_buf.length >= 4 && latin1.decode(_buf.peek(4)) == 'SSH-') {
-      _pass = true;
-      final all = _buf.take(_buf.length);
-      _deliver(all);
-      h.complete('(no HTTP header, SSH banner received)');
-      return;
-    }
-    final end = _indexOfHeaderEnd();
-    if (end < 0) {
-      if (_buf.length > 65536) h.completeError('Reply header too large');
-      return;
-    }
-    final header = latin1.decode(_buf.take(end + 4), allowInvalid: true);
-    _pass = true;
-    if (_buf.length > 0) _deliver(_buf.take(_buf.length));
-    h.complete(header);
+    _hq.add(d);
+    _drainHeaders();
   }
 
-  int _indexOfHeaderEnd() {
-    for (var i = 0; i + 3 < _buf.length; i++) {
-      if (_buf[i] == 13 && _buf[i + 1] == 10 && _buf[i + 2] == 13 && _buf[i + 3] == 10) {
-        return i;
+  void _drainHeaders() {
+    while (true) {
+      if (_skipBody > 0) {
+        final n = min(_skipBody, _hq.length);
+        _hq.skip(n);
+        _skipBody -= n;
+        if (_skipBody > 0) return;
+      }
+      if (_hq.length == 0) return;
+      final n = min(5, _hq.length);
+      final prefix = latin1.decode(_hq.peek(n), allowInvalid: true);
+      final maybeHttp = prefix.length < 5 ? 'HTTP/'.startsWith(prefix) : prefix == 'HTTP/';
+      if (!maybeHttp) {
+        // Not an HTTP response: the SSH banner (or raw data) starts here.
+        if (_head != null && !_head!.isCompleted) _head!.complete('(no HTTP response; raw data)');
+        _passThrough();
+        return;
+      }
+      if (prefix.length < 5) return; // need more bytes to decide
+      final end = _hq.indexOfCrlfCrlf();
+      if (end < 0) {
+        if (_hq.length > 16384) _fail('Oversized HTTP response header');
+        return;
+      }
+      final header = latin1.decode(_hq.take(end + 4), allowInvalid: true);
+      final first = header.split('\r\n').first;
+      final code = int.tryParse(first.split(' ').length > 1 ? first.split(' ')[1] : '') ?? 0;
+      final ok = code == 101 || (code >= 200 && code < 300);
+      if (_headers == 0) {
+        if (_head != null && !_head!.isCompleted) _head!.complete(first);
+      } else if (!ok) {
+        _fail('Proxy rejected request: $first');
+        return;
+      }
+      _headers++;
+      final cl = RegExp(r'content-length:\s*(\d+)', caseSensitive: false).firstMatch(header);
+      if (cl != null && code != 101) _skipBody = int.parse(cl.group(1)!);
+      if (ws) {
+        _passThrough();
+        return;
       }
     }
-    return -1;
+  }
+
+  void _passThrough() {
+    _pass = true;
+    if (_hq.length > 0) _deliver(_hq.take(_hq.length));
+  }
+
+  void _deliver(Uint8List d) {
+    if (_in.isClosed) return;
+    if (!ws) {
+      _in.add(d);
+      return;
+    }
+    _wq.add(d);
+    _parseFrames();
   }
 
   void _parseFrames() {
-    while (_wsBuf.length >= 2) {
-      final b0 = _wsBuf[0], b1 = _wsBuf[1];
-      final opcode = b0 & 0x0f;
-      var len = b1 & 0x7f;
+    while (_wq.length >= 2) {
+      final b0 = _wq[0];
+      final b1 = _wq[1];
+      final op = b0 & 15;
+      var len = b1 & 127;
       var off = 2;
       if (len == 126) {
-        if (_wsBuf.length < 4) return;
-        len = (_wsBuf[2] << 8) | _wsBuf[3];
+        if (_wq.length < 4) return;
+        len = (_wq[2] << 8) | _wq[3];
         off = 4;
       } else if (len == 127) {
-        if (_wsBuf.length < 10) return;
+        if (_wq.length < 10) return;
         len = 0;
         for (var i = 2; i < 10; i++) {
-          len = (len << 8) | _wsBuf[i];
+          len = (len << 8) | _wq[i];
         }
         off = 10;
-        if (len < 0 || len > (1 << 26)) {
-          _socket.destroy();
-          return;
-        }
+      }
+      if (len > 16 * 1024 * 1024) {
+        _fail('WebSocket frame too large');
+        return;
       }
       final masked = (b1 & 0x80) != 0;
-      if (masked) off += 4;
-      if (_wsBuf.length < off + len) return;
-      final hdr = _wsBuf.take(off);
-      final payload = Uint8List.fromList(_wsBuf.take(len));
+      final hdr = off + (masked ? 4 : 0);
+      if (_wq.length < hdr + len) return;
+      final all = _wq.take(hdr + len);
+      final payload = Uint8List.sublistView(all, hdr);
       if (masked) {
-        final m = hdr.sublist(off - 4, off);
         for (var i = 0; i < payload.length; i++) {
-          payload[i] ^= m[i & 3];
+          payload[i] ^= all[off + (i & 3)];
         }
       }
-      switch (opcode) {
-        case 0:
-        case 1:
-        case 2:
-          if (payload.isNotEmpty && !_in.isClosed) _in.add(payload);
-          break;
-        case 8:
-          _socket.destroy();
-          return;
-        case 9:
-          _socket.add(_frame(payload, 10));
-          break;
+      if (op == 0 || op == 1 || op == 2) {
+        if (payload.isNotEmpty && !_in.isClosed) _in.add(payload);
+      } else if (op == 8) {
+        _socket.destroy();
+        return;
+      } else if (op == 9) {
+        _socket.add(_frame(payload, 10));
       }
     }
   }
 
-  static Uint8List _frame(List<int> data, int opcode) {
+  Uint8List _frame(List<int> data, int opcode) {
     final len = data.length;
-    final hdr = BytesBuilder();
-    hdr.addByte(0x80 | opcode);
+    final hl = len < 126 ? 2 : (len < 65536 ? 4 : 10);
+    final out = Uint8List(hl + 4 + len);
+    out[0] = 0x80 | opcode;
     if (len < 126) {
-      hdr.addByte(0x80 | len);
+      out[1] = 0x80 | len;
     } else if (len < 65536) {
-      hdr.addByte(0x80 | 126);
-      hdr.addByte(len >> 8);
-      hdr.addByte(len & 255);
+      out[1] = 0x80 | 126;
+      out[2] = len >> 8;
+      out[3] = len & 255;
     } else {
-      hdr.addByte(0x80 | 127);
-      for (var i = 7; i >= 0; i--) {
-        hdr.addByte((len >> (8 * i)) & 255);
+      out[1] = 0x80 | 127;
+      for (var i = 0; i < 8; i++) {
+        out[2 + i] = (len >> (8 * (7 - i))) & 255;
       }
     }
-    final mask = Uint8List.fromList(List<int>.generate(4, (_) => _rng.nextInt(256)));
-    hdr.add(mask);
-    final body = Uint8List(len);
-    for (var i = 0; i < len; i++) {
-      body[i] = data[i] ^ mask[i & 3];
+    for (var i = 0; i < 4; i++) {
+      out[hl + i] = _rng.nextInt(256);
     }
-    hdr.add(body);
-    return hdr.toBytes();
+    for (var i = 0; i < len; i++) {
+      out[hl + 4 + i] = data[i] ^ out[hl + (i & 3)];
+    }
+    return out;
   }
 
-  Future<String> sendPayload(List<String> chunks) async {
-    _head = Completer<String>();
-    for (var i = 0; i < chunks.length; i++) {
-      _socket.add(utf8.encode(chunks[i]));
-      await _socket.flush();
-      if (i < chunks.length - 1) {
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-      }
-    }
-    final header = await _head!.future.timeout(const Duration(seconds: 10));
-    return header.split('\r\n').first;
-  }
+  void rawWrite(List<int> d) => _socket.add(d);
+  Future<void> rawFlush() => _socket.flush();
 
   @override
   Stream<Uint8List> get stream => _in.stream;
+
   @override
-  StreamSink<List<int>> get sink => _ws ? _framed : _socket;
+  StreamSink<List<int>> get sink => ws ? _framed! : _socket;
+
   @override
   Future<void> get done => _socket.done;
-  Future<void> flush() => _socket.flush();
-  @override
-  Future<void> close() async => _socket.close();
-  @override
-  void destroy() => _socket.destroy();
-}
-
-class _FramedSink implements StreamSink<List<int>> {
-  _FramedSink(this._s);
-  final Socket _s;
-
-  @override
-  void add(List<int> data) {
-    for (var i = 0; i < data.length; i += 16384) {
-      _s.add(TunnelSocket._frame(data.sublist(i, min(i + 16384, data.length)), 2));
-    }
-  }
-
-  @override
-  void addError(Object error, [StackTrace? stackTrace]) => _s.addError(error, stackTrace);
-
-  @override
-  Future<void> addStream(Stream<List<int>> stream) => stream.listen(add).asFuture<void>();
 
   @override
   Future<void> close() async {
     try {
-      _s.add(TunnelSocket._frame(const [], 8));
+      await _socket.close();
     } catch (_) {}
-    await _s.close();
   }
 
   @override
-  Future<void> get done => _s.done;
+  void destroy() {
+    _socket.destroy();
+  }
+
+  /// Newer dartssh2 releases ask sockets to flush buffered output.
+  /// Declared without @override so it compiles whether or not the interface has it.
+  Future<void> flush() => _socket.flush();
+
+  Future<void> cancel() async {
+    try {
+      await _sub.cancel();
+    } catch (_) {}
+  }
+
+  bool get isClosed => _closed;
 }
 
-Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
-  final useProxy = o.proxyHost.isNotEmpty;
-  final firstHost = useProxy ? o.proxyHost : o.host;
-  final firstPort = useProxy ? o.proxyPort : o.port;
+class _FramedSink implements StreamSink<List<int>> {
+  _FramedSink(this._t);
+  final TunnelSocket _t;
 
-  log('Connecting to $firstHost:$firstPort${useProxy ? ' (proxy)' : ''}');
-  Socket sock =
-      await Socket.connect(firstHost, firstPort, timeout: const Duration(seconds: 15));
+  @override
+  void add(List<int> data) {
+    if (data.isEmpty) return;
+    _t.rawWrite(_t._frame(data, 2));
+  }
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) {}
+
+  @override
+  Future<void> addStream(Stream<List<int>> stream) async {
+    await for (final d in stream) {
+      add(d);
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    try {
+      _t.rawWrite(_t._frame(const [], 8));
+      await _t.rawFlush();
+    } catch (_) {}
+    await _t.close();
+  }
+
+  @override
+  Future<void> get done => _t.done;
+}
+
+// --------------------------------------------------------------- transport
+
+List<String> renderPayload(String raw, String host, int port) {
+  final s = raw
+      .replaceAll('[host_port]', '$host:$port')
+      .replaceAll('[host]', host)
+      .replaceAll('[port]', '$port')
+      .replaceAll('[crlf]', '\r\n')
+      .replaceAll('[cr]', '\r')
+      .replaceAll('[lf]', '\n')
+      .replaceAll('\\r', '\r')
+      .replaceAll('\\n', '\n');
+  return s.split('[split]').where((e) => e.isNotEmpty).toList();
+}
+
+String _normHex(String s) => s.toLowerCase().replaceAll(RegExp(r'[^0-9a-f]'), '');
+
+Future<TunnelSocket> openTransport(SshOptions o, LogFn log) async {
+  final viaProxy = o.proxyHost.isNotEmpty;
+  final host = viaProxy ? o.proxyHost : o.host;
+  final port = viaProxy ? o.proxyPort : o.port;
+  log('TCP connect $host:$port');
+  Socket sock = await Socket.connect(host, port, timeout: const Duration(seconds: 15));
   sock.setOption(SocketOption.tcpNoDelay, true);
 
   if (o.useTls) {
-    final sni = expandRandomRotate(o.sni.isNotEmpty ? o.sni : o.host);
-    log('TLS handshake (SNI: $sni${o.allowInsecure ? '' : ', verified'})');
-    sock = await SecureSocket.secure(sock,
-        host: sni, onBadCertificate: o.allowInsecure ? (_) => true : null);
+    final sni = o.sni.isNotEmpty ? o.sni : (viaProxy ? o.host : host);
+    log('TLS handshake (SNI $sni)');
+    final tls = await SecureSocket.secure(
+      sock,
+      host: sni,
+      onBadCertificate: (_) => !o.verifyTls,
+    ).timeout(const Duration(seconds: 15));
+    if (o.pin.trim().isNotEmpty) {
+      final c = tls.peerCertificate;
+      if (c == null) {
+        tls.destroy();
+        throw 'TLS pin set but server sent no certificate';
+      }
+      final got = crypto.sha256.convert(c.der).toString();
+      if (got != _normHex(o.pin)) {
+        tls.destroy();
+        throw 'TLS certificate pin mismatch (got $got)';
+      }
+      log('TLS certificate pin OK');
+    }
+    sock = tls;
   }
 
-  var template = o.payload.trim();
-  if (template.isEmpty && useProxy) {
-    template = 'CONNECT [host_port] [protocol][crlf]Host: [host][crlf][crlf]';
-  }
-
-  final ts = TunnelSocket(sock, expectHeader: template.isNotEmpty, ws: o.wsFraming);
-  if (template.isNotEmpty) {
-    final chunks = buildPayload(template, host: o.host, port: o.port);
-    log('Sending payload (${chunks.length} packet${chunks.length == 1 ? '' : 's'})');
-    final line = await ts.sendPayload(chunks);
-    log('Reply: $line');
-    final ok = line.contains(' 101') || line.contains(' 200') || line.startsWith('(');
-    if (!ok) {
-      ts.destroy();
-      throw 'Proxy/server rejected payload: $line';
+  final chunks = o.payload.trim().isEmpty ? <String>[] : renderPayload(o.payload, o.host, o.port);
+  final t = TunnelSocket(sock, expectHeader: chunks.isNotEmpty, ws: o.ws);
+  if (chunks.isNotEmpty) {
+    for (var i = 0; i < chunks.length; i++) {
+      t.rawWrite(latin1.encode(chunks[i]));
+      await t.rawFlush();
+      if (i < chunks.length - 1) await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+    final first = await t.awaitHeader(const Duration(seconds: 12));
+    log('Payload response: $first');
+    final m = RegExp(r'^HTTP/\S+\s+(\d{3})').firstMatch(first);
+    if (m != null) {
+      final c = int.parse(m.group(1)!);
+      if (c != 101 && !(c >= 200 && c < 300)) {
+        t.destroy();
+        throw 'Payload rejected: $first';
+      }
     }
   }
-  return ts;
+  return t;
 }
 
-/// TCP connect latency in ms, or -1 when unreachable.
-Future<int> tcpPing(String host, int port, {Duration timeout = const Duration(seconds: 5)}) async {
-  final sw = Stopwatch()..start();
-  try {
-    final s = await Socket.connect(host, port, timeout: timeout);
-    final ms = sw.elapsedMilliseconds;
-    s.destroy();
-    return ms;
-  } catch (_) {
-    return -1;
-  }
+// --------------------------------------------------------------- SSH tunnel
+
+SSHAlgorithms _algorithms(bool legacy) {
+  const d = SSHAlgorithms();
+  if (!legacy) return d;
+  List<T> merge<T>(List<T> a, List<T> b) => [...a, ...b.where((x) => !a.contains(x))];
+  return SSHAlgorithms(
+    kex: merge(d.kex, [SSHKexType.dh14Sha1, SSHKexType.dhGexSha1, SSHKexType.dh1Sha1]),
+    hostkey: merge(d.hostkey, [SSHHostkeyType.rsaSha1]),
+    cipher: merge(d.cipher, [
+      SSHCipherType.aes128ctr,
+      SSHCipherType.aes256ctr,
+      SSHCipherType.aes128cbc,
+      SSHCipherType.aes256cbc,
+    ]),
+    mac: merge(d.mac, [SSHMacType.hmacSha1, SSHMacType.hmacMd5]),
+  );
 }
 
-/// Quick reachability test used by the Host Checker tool.
-Future<String> hostCheck({
-  required String host,
-  required int port,
-  bool tls = false,
-  String sni = '',
-  String payload = '',
-}) async {
-  final sw = Stopwatch()..start();
-  try {
-    Socket s = await Socket.connect(host, port, timeout: const Duration(seconds: 8));
-    final tcp = sw.elapsedMilliseconds;
-    var tlsMs = 0;
-    final name = expandRandomRotate(sni.isEmpty ? host : sni);
-    if (tls) {
-      s = await SecureSocket.secure(s, host: name, onBadCertificate: (_) => true);
-      tlsMs = sw.elapsedMilliseconds - tcp;
+List<SSHKeyPair> _parseKeys(List<String> a) => SSHKeyPair.fromPem(a[0], a[1].isEmpty ? null : a[1]);
+
+String _hex(List<int> b) => b.map((e) => e.toRadixString(16).padLeft(2, '0')).join();
+
+class SshTunnel {
+  SSHClient? _client;
+  TunnelSocket? _transport;
+  LocalSocks? _socks;
+  bool _stopping = false;
+  void Function(String reason)? onClosed;
+
+  bool get active => _client != null;
+
+  Future<int> start(SshOptions o, LogFn log) async {
+    _stopping = false;
+    final transport = await openTransport(o, log);
+    _transport = transport;
+
+    List<SSHKeyPair>? ids;
+    if (o.keyPem.trim().isNotEmpty) {
+      log('Decoding private key');
+      try {
+        ids = await compute(_parseKeys, [o.keyPem, o.keyPass]);
+      } catch (_) {
+        ids = _parseKeys([o.keyPem, o.keyPass]);
+      }
     }
-    final body = payload.trim().isEmpty
-        ? 'GET / HTTP/1.1\r\nHost: $name\r\nConnection: close\r\n\r\n'
-        : buildPayload(payload, host: host, port: port).join();
-    s.add(utf8.encode(body));
-    final first = await s.first.timeout(const Duration(seconds: 8));
-    s.destroy();
-    final line = latin1.decode(first, allowInvalid: true).split('\r\n').first;
-    return 'TCP ${tcp}ms${tls ? '  ·  TLS ${tlsMs}ms' : ''}\nReply: $line';
-  } catch (e) {
-    return 'Failed: $e';
-  }
-}
 
-class _Reader {
-  _Reader(Socket s) {
-    s.listen(
-      (d) {
-        final sink = _sink;
-        if (sink != null) {
-          try {
-            sink.add(d);
-          } catch (_) {}
-        } else {
-          _buf.addAll(d);
-          _wake();
-        }
+    log('SSH handshake${o.legacy ? ' (legacy algorithms allowed)' : ''}');
+    final client = SSHClient(
+      transport,
+      username: o.user,
+      identities: ids,
+      onPasswordRequest: o.pass.isEmpty ? null : () => o.pass,
+      keepAliveInterval: Duration(seconds: o.keepAlive),
+      algorithms: _algorithms(o.legacy),
+      onUserauthBanner: (b) => log('Server banner: ${b.trim()}'),
+      onVerifyHostKey: o.verifyHostKey
+          ? (String type, Uint8List fp) {
+              final seen = '$type:${_hex(fp)}';
+              if (o.hostKey.isEmpty) {
+                log('Host key pinned on first use ($type)');
+                o.onHostKey?.call(seen);
+                return true;
+              }
+              if (o.hostKey == seen) return true;
+              log('HOST KEY CHANGED - refusing to connect');
+              return false;
+            }
+          : null,
+    );
+    _client = client;
+
+    try {
+      await client.authenticated.timeout(const Duration(seconds: 30));
+    } catch (e) {
+      await stop();
+      throw _friendly(e);
+    }
+    log('SSH authenticated as ${o.user}');
+
+    client.done.then(
+      (_) {
+        if (!_stopping) onClosed?.call('SSH connection closed by server');
       },
-      onDone: () {
-        _done = true;
-        _wake();
-        if (!_closed.isCompleted) _closed.complete();
-        try {
-          _sink?.close();
-        } catch (_) {}
-      },
-      onError: (Object _) {
-        _done = true;
-        _wake();
-        if (!_closed.isCompleted) _closed.complete();
+      onError: (Object e) {
+        if (!_stopping) onClosed?.call('SSH error: $e');
       },
     );
+
+    final socks = LocalSocks(client, log);
+    await socks.start(o.socksPort, any: o.shareHotspot);
+    _socks = socks;
+    log('SOCKS5 listening on ${o.shareHotspot ? '0.0.0.0' : '127.0.0.1'}:${o.socksPort}');
+    return o.socksPort;
   }
 
-  final List<int> _buf = [];
-  Completer<void>? _c;
-  bool _done = false;
-  final Completer<void> _closed = Completer<void>();
-  StreamSink<List<int>>? _sink;
+  String _friendly(Object e) {
+    final t = e.toString();
+    if (e is SSHAuthFailError || t.contains('SSHAuthFailError')) {
+      return 'Authentication failed (check username, password or key)';
+    }
+    if (t.toLowerCase().contains('host key') || t.contains('SSHHostkeyError')) {
+      return 'Server host key rejected. If you trust the server, reset the pinned key in the profile.';
+    }
+    if (e is TimeoutException) return 'SSH handshake timed out';
+    return t;
+  }
 
-  /// Completes when the client socket ends (used by UDP ASSOCIATE).
-  Future<void> get closed => _closed.future;
+  /// Plain HTTP/1.0 GET through the tunnel (for the connection test).
+  Future<String> httpGet(String host, String path) async {
+    final c = _client;
+    if (c == null) throw 'SSH tunnel is not active';
+    final ch = await c.forwardLocal(host, 80).timeout(const Duration(seconds: 15));
+    try {
+      ch.sink.add(utf8.encode('GET $path HTTP/1.0\r\nHost: $host\r\nUser-Agent: curl/8\r\n\r\n'));
+      final bb = BytesBuilder();
+      await ch.stream.timeout(const Duration(seconds: 15)).forEach(bb.add);
+      final s = utf8.decode(bb.takeBytes(), allowMalformed: true);
+      final i = s.indexOf('\r\n\r\n');
+      return i < 0 ? s : s.substring(i + 4);
+    } finally {
+      ch.destroy();
+    }
+  }
+
+  Future<void> stop() async {
+    _stopping = true;
+    final s = _socks;
+    final c = _client;
+    final t = _transport;
+    _socks = null;
+    _client = null;
+    _transport = null;
+    try {
+      await s?.stop();
+    } catch (_) {}
+    try {
+      await c?.close().timeout(const Duration(seconds: 3));
+    } catch (_) {}
+    t?.destroy();
+    await t?.cancel();
+  }
+}
+
+// ------------------------------------------------------------- SOCKS5 server
+
+class _Reader {
+  _Reader(this._s) {
+    _s.listen(_onData, onDone: _onDone, onError: (Object _) => _onDone(), cancelOnError: true);
+  }
+
+  final Socket _s;
+  final List<int> _buf = <int>[];
+  Completer<void>? _wait;
+  bool closed = false;
+  void Function(Uint8List)? onData;
+  void Function()? onClosed;
 
   void _wake() {
-    final c = _c;
-    _c = null;
-    if (c != null && !c.isCompleted) c.complete();
+    final w = _wait;
+    _wait = null;
+    if (w != null && !w.isCompleted) w.complete();
+  }
+
+  void _onData(Uint8List d) {
+    final cb = onData;
+    if (cb != null) {
+      cb(d);
+      return;
+    }
+    _buf.addAll(d);
+    _wake();
+  }
+
+  void _onDone() {
+    closed = true;
+    _wake();
+    onClosed?.call();
   }
 
   Future<List<int>> read(int n) async {
     while (_buf.length < n) {
-      if (_done) throw 'closed';
-      _c = Completer<void>();
-      await _c!.future;
+      if (closed) throw 'closed';
+      _wait = Completer<void>();
+      await _wait!.future;
     }
-    final out = _buf.sublist(0, n);
+    final r = _buf.sublist(0, n);
     _buf.removeRange(0, n);
-    return out;
+    return r;
   }
 
-  void pipeTo(StreamSink<List<int>> sink) {
+  void pipe(StreamSink<List<int>> sink) {
     if (_buf.isNotEmpty) {
-      sink.add(List<int>.from(_buf));
+      sink.add(Uint8List.fromList(_buf));
       _buf.clear();
     }
-    _sink = sink;
-  }
-}
-
-class _Flow {
-  _Flow(this.relay, this.ip, this.port, this.key);
-  final UdpRelay relay;
-  final Uint8List ip;
-  final int port;
-  final String key;
-}
-
-String _hex(List<int> b) => b.map((e) => e.toRadixString(16).padLeft(2, '0')).join();
-
-/// UDP over SSH using the badvpn-udpgw protocol (see udpgw.dart). One SSH
-/// channel to 127.0.0.1:<udpgwPort> on the server carries every UDP flow.
-class UdpGw {
-  UdpGw(this._client, this._port, this._log);
-  final SSHClient _client;
-  final int _port;
-  final Log _log;
-
-  SSHForwardChannel? _ch;
-  Future<SSHForwardChannel>? _opening;
-  UdpgwParser _parser = UdpgwParser();
-  final Map<int, _Flow> _byId = {};
-  final Map<String, int> _byKey = {};
-  Timer? _ka;
-  bool _closed = false;
-  int _next = 1;
-  bool _warnedClosed = false;
-  DateTime? _failUntil;
-
-  Future<SSHForwardChannel> _channel() {
-    final c = _ch;
-    if (c != null) return Future.value(c);
-    return _opening ??= _open();
-  }
-
-  Future<SSHForwardChannel> _open() async {
-    try {
-      final ch = await _client.forwardLocal('127.0.0.1', _port);
-      _ch = ch;
-      _parser = UdpgwParser();
-      _log('UDPGW channel open (server 127.0.0.1:$_port)');
-      ch.stream.listen(_onData,
-          onDone: _onClosed, onError: (Object _) => _onClosed(), cancelOnError: true);
-      _ka?.cancel();
-      _ka = Timer.periodic(const Duration(seconds: 25), (_) => _write(udpgwKeepalive()));
-      return ch;
-    } finally {
-      _opening = null;
-    }
-  }
-
-  void _onClosed() {
-    _ch = null;
-    _ka?.cancel();
-    _byId.clear();
-    _byKey.clear();
-    if (!_closed && !_warnedClosed) {
-      _warnedClosed = true;
-      _log('UDPGW channel closed (is badvpn-udpgw running on the server?)');
-    }
-  }
-
-  void _write(Uint8List bytes) {
-    try {
-      _ch?.sink.add(bytes);
-    } catch (_) {}
-  }
-
-  int _alloc() {
-    for (var i = 0; i < 65535; i++) {
-      final id = _next;
-      _next = _next >= 65535 ? 1 : _next + 1;
-      if (!_byId.containsKey(id)) return id;
-    }
-    throw 'no free udpgw connection id';
-  }
-
-  Future<void> send(UdpRelay relay, Uint8List ip, int port, Uint8List data) async {
-    if (_closed) return;
-    final fu = _failUntil;
-    if (fu != null && DateTime.now().isBefore(fu)) return; // server has no udpgw: back off
-    final key = '${relay.id}|${_hex(ip)}:$port';
-    var id = _byKey[key];
-    if (id == null) {
-      if (_byId.length >= 250) {
-        final oldId = _byId.keys.first;
-        final old = _byId.remove(oldId);
-        if (old != null) _byKey.remove(old.key);
-      }
-      id = _alloc();
-      _byKey[key] = id;
-      _byId[id] = _Flow(relay, ip, port, key);
-    } else {
-      final f = _byId.remove(id);
-      if (f != null) _byId[id] = f; // refresh LRU position
-    }
-    try {
-      final pkt = buildUdpgwPacket(flags: 0, conid: id, ip: ip, port: port, data: data);
-      await _channel();
-      _write(pkt);
-    } catch (e) {
-      _failUntil = DateTime.now().add(const Duration(seconds: 30));
-      _log('UDPGW unavailable, UDP dropped for 30s: $e');
-    }
-  }
-
-  void _onData(Uint8List d) {
-    for (final p in _parser.feed(d)) {
-      if (p.isKeepalive) continue;
-      _byId[p.conid]?.relay.deliver(p.ip, p.port, p.data);
-    }
-  }
-
-  void forget(UdpRelay r) {
-    final ids = [for (final e in _byId.entries) if (e.value.relay == r) e.key];
-    for (final id in ids) {
-      final f = _byId.remove(id);
-      if (f != null) _byKey.remove(f.key);
-    }
-  }
-
-  void close() {
-    _closed = true;
-    _ka?.cancel();
-    try {
-      _ch?.destroy();
-    } catch (_) {}
-    _ch = null;
-    _byId.clear();
-    _byKey.clear();
-  }
-}
-
-/// One SOCKS5 UDP ASSOCIATE session: a loopback UDP socket the Xray core
-/// talks to, bridged to the shared [UdpGw] channel.
-class UdpRelay {
-  UdpRelay(this.id, this._gw, this._log);
-  final int id;
-  final UdpGw _gw;
-  final Log _log;
-  RawDatagramSocket? _sock;
-  InternetAddress? _peer;
-  int _peerPort = 0;
-  bool _warned = false;
-
-  Future<int> start() async {
-    final s = await RawDatagramSocket.bind(InternetAddress.loopbackIPv4, 0);
-    _sock = s;
-    s.listen(_onEvent);
-    return s.port;
-  }
-
-  void _onEvent(RawSocketEvent e) {
-    if (e != RawSocketEvent.read) return;
-    Datagram? d;
-    while ((d = _sock?.receive()) != null) {
-      final dg = d!;
-      _peer = dg.address;
-      _peerPort = dg.port;
-      final p = Socks5Udp.parse(dg.data);
-      if (p == null) {
-        if (!_warned) {
-          _warned = true;
-          _log('UDP: dropped a datagram (fragment or domain destination; udpgw needs an IP)');
-        }
-        continue;
-      }
-      _gw.send(this, p.ip, p.port, p.data);
-    }
-  }
-
-  void deliver(Uint8List ip, int port, Uint8List data) {
-    final peer = _peer;
-    if (peer == null) return;
-    try {
-      _sock?.send(Socks5Udp.build(ip, port, data), peer, _peerPort);
-    } catch (_) {}
-  }
-
-  void close() {
-    _sock?.close();
-    _sock = null;
-    _gw.forget(this);
+    onData = (d) {
+      try {
+        sink.add(d);
+      } catch (_) {}
+    };
   }
 }
 
 class LocalSocks {
-  LocalSocks(
-    this._client,
-    this._log, {
-    this.bindAll = false,
-    this.udpgwPort = 0,
-    this.authUser = '',
-    this.authPass = '',
-  });
+  LocalSocks(this._client, this._log);
   final SSHClient _client;
-  final Log _log;
-  final bool bindAll;
-  final int udpgwPort;
-
-  /// RFC 1929 credentials, required only for non-loopback clients (hotspot).
-  final String authUser;
-  final String authPass;
+  final LogFn _log;
   ServerSocket? _server;
-  UdpGw? _udp;
-  final Set<UdpRelay> _relays = {};
-  int _relayId = 0;
+  int _active = 0;
+  static const _maxActive = 400;
 
-  Future<void> start(int port) async {
+  Future<void> start(int port, {bool any = false}) async {
     _server = await ServerSocket.bind(
-        bindAll ? InternetAddress.anyIPv4 : InternetAddress.loopbackIPv4, port);
-    _server!.listen(_handle);
-    _log('SOCKS5 listening on ${bindAll ? '0.0.0.0' : '127.0.0.1'}:$port'
-        '${udpgwPort > 0 ? '  (UDP via udpgw :$udpgwPort)' : ''}');
+      any ? InternetAddress.anyIPv4 : InternetAddress.loopbackIPv4,
+      port,
+      shared: false,
+    );
+    _server!.listen(_handle, onError: (Object _) {});
   }
 
   Future<void> stop() async {
-    await _server?.close();
+    final s = _server;
     _server = null;
-    for (final r in _relays.toList()) {
-      r.close();
-    }
-    _relays.clear();
-    _udp?.close();
-    _udp = null;
+    await s?.close();
+  }
+
+  static const _fail = [5, 1, 0, 1, 0, 0, 0, 0, 0, 0];
+  static const _refused = [5, 5, 0, 1, 0, 0, 0, 0, 0, 0];
+  static const _unsupported = [5, 7, 0, 1, 0, 0, 0, 0, 0, 0];
+
+  Future<void> _reject(Socket s, List<int> reply) async {
+    try {
+      s.add(reply);
+      await s.flush();
+    } catch (_) {}
+    s.destroy();
   }
 
   Future<void> _handle(Socket s) async {
+    s.setOption(SocketOption.tcpNoDelay, true);
+    if (_active >= _maxActive) {
+      s.destroy();
+      return;
+    }
+    _active++;
+    s.done.then((_) {}, onError: (Object _) {}).whenComplete(() => _active--);
     final r = _Reader(s);
     try {
-      final g = await r.read(2);
-      if (g[0] != 5) throw 'not socks5';
-      final methods = await r.read(g[1]);
-      final needAuth = authUser.isNotEmpty && !s.remoteAddress.isLoopback;
-      if (needAuth) {
-        if (!methods.contains(2)) {
-          s.add([5, 0xff]);
-          await s.close();
-          return;
-        }
-        s.add([5, 2]);
-        final v = await r.read(2);
-        final u = utf8.decode(await r.read(v[1]), allowMalformed: true);
-        final pl = (await r.read(1))[0];
-        final p = utf8.decode(await r.read(pl), allowMalformed: true);
-        if (u != authUser || p != authPass) {
-          s.add([1, 1]);
-          await s.close();
-          return;
-        }
-        s.add([1, 0]);
-      } else {
-        s.add([5, 0]);
+      final g = await r.read(2).timeout(const Duration(seconds: 10));
+      if (g[0] != 5) {
+        s.destroy();
+        return;
       }
-
-      final h = await r.read(4);
+      await r.read(g[1]);
+      s.add([5, 0]);
+      final h = await r.read(4).timeout(const Duration(seconds: 10));
+      if (h[1] != 1) {
+        await _reject(s, _unsupported);
+        return;
+      }
       String host;
       switch (h[3]) {
         case 1:
           host = (await r.read(4)).join('.');
           break;
         case 3:
-          final len = (await r.read(1))[0];
-          host = utf8.decode(await r.read(len), allowMalformed: true);
+          final n = (await r.read(1))[0];
+          host = utf8.decode(await r.read(n), allowMalformed: true);
           break;
         case 4:
-          host = InternetAddress.fromRawAddress(Uint8List.fromList(await r.read(16))).address;
+          final b = await r.read(16);
+          final parts = <String>[];
+          for (var i = 0; i < 16; i += 2) {
+            parts.add(((b[i] << 8) | b[i + 1]).toRadixString(16));
+          }
+          host = parts.join(':');
           break;
         default:
-          throw 'bad address type';
+          await _reject(s, _fail);
+          return;
       }
       final pb = await r.read(2);
       final port = (pb[0] << 8) | pb[1];
 
-      if (h[1] == 3) {
-        await _udpAssociate(s, r);
-        return;
-      }
-      if (h[1] != 1) {
-        s.add([5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
-        await s.close();
-        return;
-      }
-
       SSHForwardChannel ch;
       try {
-        ch = await _client.forwardLocal(host, port);
-      } catch (_) {
-        s.add([5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
-        await s.close();
+        ch = await _client.forwardLocal(host, port).timeout(const Duration(seconds: 20));
+      } catch (e) {
+        await _reject(s, _refused);
         return;
       }
       s.add([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
 
-      ch.stream.listen(
-        (d) {
-          try {
-            s.add(d);
-          } catch (_) {}
-        },
-        onDone: () => s.close(),
-        onError: (Object _) => s.destroy(),
-        cancelOnError: true,
+      // remote -> local (addStream applies back-pressure to the SSH channel)
+      unawaited(
+        s.addStream(ch.stream).then<void>(
+          (_) => s.close(),
+          onError: (Object _) {
+            s.destroy();
+          },
+        ).catchError((Object _) {
+          s.destroy();
+        }),
       );
-      r.pipeTo(ch.sink);
+      // local -> remote
+      r.onClosed = () {
+        try {
+          ch.sink.close();
+        } catch (_) {}
+      };
+      r.pipe(ch.sink);
     } catch (_) {
-      s.destroy();
-    }
-  }
-
-  Future<void> _udpAssociate(Socket s, _Reader r) async {
-    if (udpgwPort <= 0) {
-      s.add([5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
-      await s.close();
-      return;
-    }
-    final gw = _udp ??= UdpGw(_client, udpgwPort, _log);
-    final relay = UdpRelay(++_relayId, gw, _log);
-    _relays.add(relay);
-    try {
-      final p = await relay.start();
-      s.add([5, 0, 0, 1, 127, 0, 0, 1, (p >> 8) & 0xff, p & 0xff]);
-      await r.closed; // the association lives as long as this TCP connection
-    } finally {
-      relay.close();
-      _relays.remove(relay);
       s.destroy();
     }
   }
 }
 
-class SshTunnel {
-  SSHClient? _client;
-  LocalSocks? _socks;
-  bool _alive = false;
-  void Function()? onClosed;
+// -------------------------------------------------------------- host checker
 
-  bool get alive => _alive;
-
-  Future<int> start(SshOptions o, Log log, {int socksPort = 10808}) async {
-    final sock = await openTransport(o, log);
-    log('SSH handshake + auth as ${o.user}');
-    List<SSHKeyPair>? ids;
-    if (o.keyPem.trim().isNotEmpty) {
-      ids = SSHKeyPair.fromPem(o.keyPem, o.keyPass.isEmpty ? null : o.keyPass);
+/// Connects like the tunnel would and reports what the server says.
+Future<String> hostCheck(String host, int port, {bool tls = false, String sni = ''}) async {
+  final out = StringBuffer();
+  final sw = Stopwatch()..start();
+  Socket? sock;
+  try {
+    sock = await Socket.connect(host, port, timeout: const Duration(seconds: 8));
+    out.writeln('TCP connect: ${sw.elapsedMilliseconds} ms');
+    if (tls) {
+      sw.reset();
+      final t = await SecureSocket.secure(
+        sock,
+        host: sni.isNotEmpty ? sni : host,
+        onBadCertificate: (_) => true,
+      ).timeout(const Duration(seconds: 8));
+      sock = t;
+      out.writeln('TLS handshake: ${sw.elapsedMilliseconds} ms');
+      final c = t.peerCertificate;
+      if (c != null) {
+        out.writeln('Cert subject: ${c.subject}');
+        out.writeln('Cert SHA-256: ${crypto.sha256.convert(c.der)}');
+      }
     }
-    final client = SSHClient(
-      sock,
-      username: o.user,
-      identities: ids,
-      onPasswordRequest: o.pass.isEmpty ? null : () => o.pass,
-      onVerifyHostKey: o.verifyHostKey,
-      keepAliveInterval: Duration(seconds: o.keepAlive),
-    );
-    _client = client;
-    try {
-      await client.authenticated.timeout(const Duration(seconds: 25));
-    } catch (e) {
-      client.close();
-      _client = null;
-      rethrow;
-    }
-    log('SSH authenticated');
-    _alive = true;
-
-    client.done.then((_) {
-      _alive = false;
-      log('SSH session ended');
-      onClosed?.call();
-    }).catchError((Object e) {
-      _alive = false;
-      log('SSH error: $e');
-      onClosed?.call();
-    });
-
-    _socks = LocalSocks(
-      client,
-      log,
-      bindAll: o.shareHotspot,
-      udpgwPort: o.udpgwPort,
-      authUser: o.shareHotspot ? o.hotspotUser : '',
-      authPass: o.shareHotspot ? o.hotspotPass : '',
-    );
-    await _socks!.start(socksPort);
-    return socksPort;
-  }
-
-  /// Plain HTTP GET through the SSH tunnel (used for the exit-IP check, since
-  /// in SSH mode this app itself is excluded from the VPN).
-  Future<String> httpGet(String host, String path) async {
-    final c = _client;
-    if (c == null || !_alive) throw 'SSH tunnel is not connected';
-    final ch = await c.forwardLocal(host, 80).timeout(const Duration(seconds: 8));
-    ch.sink.add(utf8.encode(
-        'GET $path HTTP/1.0\r\nHost: $host\r\nConnection: close\r\nUser-Agent: curl/8.5\r\n\r\n'));
     final bb = BytesBuilder();
     try {
-      await for (final d in ch.stream.timeout(const Duration(seconds: 8))) {
+      await sock.timeout(const Duration(seconds: 4)).forEach((d) {
         bb.add(d);
-        if (bb.length > 65536) break;
-      }
-    } finally {
-      ch.destroy();
+        if (bb.length >= 255 || bb.toBytes().contains(10)) throw const _Stop();
+      });
+    } on _Stop {
+      // got enough
+    } on TimeoutException {
+      // server stayed silent
     }
-    final txt = latin1.decode(bb.toBytes(), allowInvalid: true);
-    final i = txt.indexOf('\r\n\r\n');
-    return i < 0 ? txt : txt.substring(i + 4);
+    final banner = latin1.decode(bb.takeBytes(), allowInvalid: true).trim();
+    out.writeln(banner.isEmpty ? 'Banner: (none within 4s)' : 'Banner: ${banner.split('\n').first}');
+  } catch (e) {
+    out.writeln('Failed: $e');
+  } finally {
+    sock?.destroy();
   }
+  return out.toString().trim();
+}
 
-  /// Streams an HTTP resource through the tunnel and returns the bytes received
-  /// (headers excluded) within [maxSeconds] / [maxBytes]. Used by the speed test.
-  Future<int> httpDownload(String host, int port, String path,
-      {int maxSeconds = 10, int maxBytes = 30 * 1024 * 1024}) async {
-    final c = _client;
-    if (c == null || !_alive) throw 'SSH tunnel is not connected';
-    final ch = await c.forwardLocal(host, port).timeout(const Duration(seconds: 8));
-    ch.sink.add(utf8.encode(
-        'GET $path HTTP/1.0\r\nHost: $host\r\nUser-Agent: curl/8.5\r\nAccept: */*\r\n\r\n'));
-    final sw = Stopwatch()..start();
-    var total = 0;
-    var headerDone = false;
-    final head = BytesBuilder();
-    try {
-      await for (final d in ch.stream.timeout(const Duration(seconds: 8))) {
-        if (!headerDone) {
-          head.add(d);
-          final txt = latin1.decode(head.toBytes(), allowInvalid: true);
-          final i = txt.indexOf('\r\n\r\n');
-          if (i < 0) continue;
-          final status = txt.split('\r\n').first;
-          if (!status.contains(' 200')) throw 'Server answered: $status';
-          headerDone = true;
-          total += head.length - (i + 4);
-        } else {
-          total += d.length;
-        }
-        if (total >= maxBytes || sw.elapsed.inSeconds >= maxSeconds) break;
-      }
-    } finally {
-      ch.destroy();
-    }
-    return total;
-  }
-
-  Future<void> stop() async {
-    onClosed = null;
-    _alive = false;
-    await _socks?.stop();
-    _socks = null;
-    _client?.close();
-    _client = null;
-  }
+class _Stop implements Exception {
+  const _Stop();
 }

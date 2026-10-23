@@ -1,73 +1,45 @@
+import 'dart:typed_data';
 import 'package:flutter/services.dart';
 
 class AppInfo {
-  const AppInfo(this.label, this.package);
-  final String label;
+  AppInfo(this.package, this.label);
   final String package;
+  final String label;
 }
 
-/// Bridge to MainActivity.kt (installed in CI by tools/patch_android.py).
+/// Thin wrapper around the Kotlin MethodChannel written by tools/patch_android.py.
 class Native {
-  static const _c = MethodChannel('xyz.xray.vpn/native');
-  static const ownPackage = 'xyz.xray.vpn';
+  static const _c = MethodChannel('xyz.xray.vpn/system');
 
-  static Future<void> moveToBack() async {
+  static Future<List<AppInfo>> listApps() async {
     try {
-      await _c.invokeMethod('moveToBack');
-    } catch (_) {}
+      final r = await _c.invokeListMethod<Map>('listApps') ?? const [];
+      return [
+        for (final m in r) AppInfo('${m['package']}', '${m['label']}'),
+      ];
+    } catch (_) {
+      return [];
+    }
   }
 
-  static void Function(String link)? _onLink;
-
-  /// Receives links that open the app while it is already running.
-  static void setLinkHandler(void Function(String link) handler) {
-    _onLink = handler;
-    _c.setMethodCallHandler((call) async {
-      if (call.method == 'onLink' && call.arguments is String) {
-        _onLink?.call(call.arguments as String);
-      }
-      return null;
-    });
-  }
-
-  /// The link that launched the app (vless:// ...), once.
-  static Future<String?> takeLink() async {
+  static Future<Uint8List?> icon(String package) async {
     try {
-      return await _c.invokeMethod<String>('takeLink');
+      return await _c.invokeMethod<Uint8List>('appIcon', package);
     } catch (_) {
       return null;
     }
   }
 
-  static Future<List<AppInfo>> installedApps() async {
-    final r = await _c.invokeMethod<List<dynamic>>('installedApps') ?? const [];
-    return [
-      for (final e in r)
-        AppInfo((e as Map)['label'].toString(), e['package'].toString()),
-    ];
-  }
-
-  static Future<bool> ignoringBatteryOptimizations() async {
+  static Future<bool> _bool(String m) async {
     try {
-      return await _c.invokeMethod<bool>('isIgnoringBatteryOptimizations') ?? false;
+      return await _c.invokeMethod<bool>(m) ?? false;
     } catch (_) {
       return false;
     }
   }
 
-  static Future<bool> requestIgnoreBatteryOptimizations() async {
-    try {
-      return await _c.invokeMethod<bool>('requestIgnoreBatteryOptimizations') ?? false;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  static Future<bool> openVpnSettings() async {
-    try {
-      return await _c.invokeMethod<bool>('openVpnSettings') ?? false;
-    } catch (_) {
-      return false;
-    }
-  }
+  static Future<bool> openVpnSettings() => _bool('openVpnSettings');
+  static Future<bool> ignoringBatteryOptimizations() => _bool('isIgnoringBattery');
+  static Future<bool> openBatterySettings() => _bool('openBatterySettings');
+  static Future<bool> requestNotifications() => _bool('requestNotifications');
 }

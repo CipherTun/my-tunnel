@@ -1,84 +1,70 @@
-# XRay Vpn  (`xyz.xray.vpn`)
+# XRay Vpn
 
-Android tunnel client built with Flutter. One app, six profile types:
+Android tunnel client built with Flutter. Package `xyz.xray.vpn`, app name **XRay Vpn**.
 
-| Profile | What it does |
-|---|---|
-| **SSH Tunnel** | SSH over plain TCP, HTTP proxy + custom payload, TLS/SNI wrapper, WebSocket upgrade/framing. Local SOCKS5 server feeds the Xray TUN core. **TCP and UDP** (UDP through `badvpn-udpgw`). |
-| **V2Ray / Xray / Hysteria2** | VMess, VLESS (incl. REALITY, XHTTP), Trojan, Shadowsocks, SOCKS, Hysteria2 via share links, manual form, or raw Xray JSON. |
-| **WireGuard** | Paste a wg-quick config, run through the Xray core. |
-| **OpenVPN** | Paste a `.ovpn` (UDP/TCP, user/pass, encrypted keys). Real OpenVPN 2.7 engine (ics-openvpn) via `openvpn_flutter`. |
-| **Proxy chain** | entry → exit, two TCP-based Xray profiles chained with `sockopt.dialerProxy`. |
-| **Failover group** | Tries members in order; can be sorted by measured latency. |
+| Mode | Engine | Notes |
+|---|---|---|
+| SSH | `dartssh2` 4.x, in Dart | Payload, `[split]`, HTTP proxy hop, TLS/SNI, WebSocket framing, key or password auth |
+| Xray | Xray core via `flutter_v2ray_client` 3.5 | VLESS (Reality/Vision), VMess, Trojan, Shadowsocks, Hysteria2, raw JSON |
+| WireGuard | Xray WireGuard outbound | Paste a wg-quick config |
+| Group | App logic | Ordered failover across profiles |
 
-All networking is real: the TUN/VPN service and protocol cores come from `flutter_v2ray_client`
-(Xray core), SSH from `dartssh2`.
+## Build (GitHub Actions)
 
-## What is new in 2.2
+Push to `main`, `master` or `dev`. The workflow runs `flutter create --org xyz.xray --project-name vpn`,
+`tools/patch_android.py`, `flutter analyze`, then builds a universal release APK (arm, arm64, x64).
+Flutter is pinned to `3.47.x`.
 
-* **OpenVPN** profiles (new protocol, real engine) and **proxy chains**.
-* **CDN clean-IP scanner** (TCP+TLS handshake probe, loads Cloudflare's published ranges) and a per-profile
-  **connect-address override** (dial the fast IP, keep SNI/Host).
-* **Speed test** through the tunnel (also works in SSH mode), **data-usage history** (today / 7 / 30 days, per profile).
-* **Block QUIC (UDP 443)** and **uTLS fingerprint override** for Xray profiles.
-* **Open links from other apps**: `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, `hy2://` deep links,
-  plus a clipboard prompt when a share link is copied.
-* Auto-refresh of subscriptions, sort profiles by latency, SSH-server setup guide (badvpn-udpgw).
-* **Bug fix found while researching:** the TLS-fragment helper outbound used a `domainStrategy` field that Xray
-  26.9 moved into `sockopt`; it is removed.
+**Signing:** add repository secrets `RELEASE_KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`
+(and `KEY_PASSWORD` if it differs). Without them the APK is debug-signed with a different key on
+every run, so Android will refuse to update over the previous build.
 
-## What was new in 2.1
-
-* Renamed to **XRay Vpn**, application id / namespace **`xyz.xray.vpn`** (CI generates `android/` with
-  `--org xyz.xray --project-name vpn` and `tools/patch_android.py` enforces and verifies it).
-* **UDP over SSH** (badvpn-udpgw protocol, verified against badvpn's `udpgw.c` / `packetproto.h`):
-  SOCKS5 UDP ASSOCIATE implemented in `LocalSocks`. Needs `badvpn-udpgw --listen-addr 127.0.0.1:7300` on the server.
-* **SSH host-key pinning** (trust on first use; a changed key is refused).
-* **Subscriptions** (plain or base64 lists, refresh, per-subscription profiles).
-* **Latency tests** per profile (real core delay test / TCP connect for SSH), failover sorting.
-* **Live stats** (speed, totals, duration), in-tunnel delay test, exit-IP check.
-* **Health check** that detects "connected but dead" tunnels and reconnects.
-* **Xray TLS fragment + Mux** options (per Xray freedom-outbound docs).
-* **App picker** for apps that bypass the VPN, via a small native bridge (`tools/native/MainActivity.kt`).
-* **Credentials in Android Keystore-backed secure storage** (auto-migrated from the old plaintext prefs).
-* QR code export, full backup/restore, theme setting, auto-connect, battery-optimisation + Always-on/kill-switch shortcuts.
-* Optional SOCKS username/password when sharing over hotspot.
-* Unit tests for the udpgw codec, payload engine, config tweaks, subscriptions, importers.
-
-## Bugs fixed from the previous source
-
-* **SSH loop:** in SSH mode this app's own sockets were routed back into the VPN. The app is now always
-  excluded in SSH mode.
-* Notification permission (Android 13+) was never requested, so the foreground notification was hidden.
-* Race / null-deref on the tunnel-up completer; duplicate reconnect timers when both SSH and the core reported a drop.
-* Orphaned VPN service after the activity was destroyed is stopped on start; Back now moves the app to the
-  background while connected instead of destroying it (which would kill the Dart-hosted SSH tunnel).
-* SSH accepted any host key; WebSocket framing used O(n²) buffer handling; `@override` on a non-interface member.
-* Hysteria/SSH TLS options: certificate verification can now be turned on (default stays permissive for fronting).
-
-## Build
-
-CI (`.github/workflows/build.yml`) does everything: `flutter create`, `patch_android.py`, `analyze`, `test`,
-release APK (arm, arm64, x64). Locally:
-
+```sh
+keytool -genkeypair -keystore xray.p12 -storetype PKCS12 -keyalg RSA -keysize 4096 -validity 10000 -alias xray
+base64 -w0 xray.p12   # paste into RELEASE_KEYSTORE_BASE64
 ```
-flutter create --platforms=android --org xyz.xray --project-name vpn .
-python3 tools/patch_android.py
-flutter pub get && flutter test && flutter build apk --release
-```
-The APK is debug-signed by default; add your own signing config for distribution.
 
-## Known limitations
+## Not verified yet
 
-* The SSH tunnel runs in the app's Dart isolate. Swiping the app away from Recents stops it (use Back / Home).
-* "Only these apps use the VPN" is not offered: the plugin only supports a bypass list.
-* Not included, because each needs a native engine that cannot be faked or safely mixed in blind:
-  TUIC, AnyTLS, NaiveProxy, Hysteria v1, ShadowsocksR (sing-box core; a second Go engine next to Xray risks
-  native-library clashes), DNSTT/SlowDNS, Psiphon, Tor. WireGuard and Hysteria2 are covered by the Xray core.
-* OpenVPN profiles are not covered by the SSH-only features (UDP gateway, host pinning, fragment, Mux).
+This source was written without a Flutter toolchain, so it has **not been compiled or run**. The CI `analyze`
+step is the first real check. Things most worth watching on the first run:
 
-## Licence note
+1. `dartssh2` algorithm enum names used for legacy-server support (`ssh_tunnel.dart`, `_algorithms`).
+2. `TunnelSocket` implements `SSHSocket`; a `flush()` method is provided for newer dartssh2 versions.
+3. The plugin's behaviour with the DNS rules in `core_config.dart` (`applyNetwork`), based on Xray's docs.
+4. `mipmap/ic_stat_vpn` as the notification icon (a vector placed in the mipmap folder).
 
-`openvpn_flutter` and its ics-openvpn engine are **GPLv3**. An app that bundles them must be distributed under
-GPL-compatible terms with source available. Remove the OpenVPN profile type (and that dependency) if you need a
-different licence.
+## What is different from the previous version
+
+- **Fix:** SSH mode now excludes this app from the VPN, otherwise the SSH socket's own traffic can be routed back into the tunnel.
+- **Fix:** the Dart engine now outlives the Activity (see `MainActivity.kt`). Before, pressing Back destroyed the SSH tunnel while the VPN service kept running.
+- **Fix:** `^2.9.0` resolved to dartssh2 2.22.x, where `SSHSocket` gained `flush()`; upgraded to 4.x with a compatible socket.
+- **Fix:** dartssh2 4.x removed legacy algorithms by default; they are re-added (after modern ones) behind a per-profile switch.
+- **Fix:** DNS in SSH mode. The plugin's default config has no DNS rules, so app UDP DNS would hit a SOCKS server that cannot do UDP. DNS is now answered by the core's resolver (Xray's documented DNS hijack) over TCP through SSH. The DNS settings now really apply.
+- **Fix:** connect/disconnect race (stale timers could trigger a spurious retry).
+- **Fix:** stopping from the notification no longer triggers auto-reconnect.
+- **Fix:** local SOCKS port is validated (10807 belongs to the core).
+- **Fix:** minSdk is never set below what Flutter needs; native libs use Gradle's `useLegacyPackaging`.
+- **Fix:** notification icon is a proper monochrome icon; resource shrinking cannot strip it.
+- **Fix:** VLESS defaults to TLS (3.5 rejects plaintext VLESS to public IPs).
+- WebSocket framing no longer copies buffers per frame; HTTP responses from multi-part payloads are consumed correctly.
+
+## New
+
+Subscriptions (URL, base64 or plain, refresh keeps your edits) · latency test · live speed/total/time ·
+health-check watchdog with reconnect · app picker for split tunnelling · log viewer (app + core) ·
+host-key pinning · TLS certificate pinning · private-key decoding off the UI thread · failover group reordering ·
+connect on launch · battery-optimization and Always-on VPN shortcuts · backup/restore · dark/light theme ·
+connection test (public IP through the tunnel) · new icon.
+
+## Known limits
+
+- **SSH mode carries TCP only.** Other UDP is rejected so apps fall back to TCP (QUIC to TCP). UDP-over-SSH needs `badvpn-udpgw`.
+- Xray-mode DNS settings apply only when you choose a non-default resolver.
+- Per-app "only these apps" mode is not offered: the plugin exposes only a bypass list.
+
+## Suggested next steps
+
+1. **UDPGW** for UDP over SSH. The packet layout is documented in badvpn, but byte order and reply handling must be tested against a live `udpgw` server before shipping.
+2. **QR scanning** (needs a camera plugin) and QR export.
+3. **DNSTT / SlowDNS, OpenVPN, TUIC, AnyTLS:** need a native core. A sing-box core would cover several of these.

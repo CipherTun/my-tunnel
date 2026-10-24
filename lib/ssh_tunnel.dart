@@ -127,7 +127,8 @@ class _ByteQueue {
 /// payload/proxy produces before the SSH banner, and optionally speaks
 /// WebSocket framing (client frames masked, server frames parsed).
 class TunnelSocket implements SSHSocket {
-  TunnelSocket(this._socket, {required bool expectHeader, required this.ws}) {
+  TunnelSocket(this._socket, {required bool expectHeader, required this.ws})
+      : _webSocketActive = ws {
     _pass = !expectHeader;
     if (expectHeader) _head = Completer<String>();
     _sub = _socket.listen(
@@ -136,11 +137,12 @@ class TunnelSocket implements SSHSocket {
       onDone: _onDone,
       cancelOnError: true,
     );
-    if (ws) _framed = _FramedSink(this);
+    if (_webSocketActive) _framed = _FramedSink(this);
   }
 
   final Socket _socket;
   final bool ws;
+  bool _webSocketActive;
   late final StreamSubscription<Uint8List> _sub;
   final StreamController<Uint8List> _in = StreamController<Uint8List>();
   final _ByteQueue _hq = _ByteQueue();
@@ -219,7 +221,15 @@ class TunnelSocket implements SSHSocket {
       _headers++;
       final cl = RegExp(r'content-length:\s*(\d+)', caseSensitive: false).firstMatch(header);
       if (cl != null && code != 101) _skipBody = int.parse(cl.group(1)!);
-      if (ws) {
+
+      // A server-confirmed WebSocket upgrade takes precedence over the
+      // profile toggle: SSH bytes must be carried inside WebSocket frames.
+      if (code == 101 &&
+          RegExp(r'(?im)^upgrade:\s*websocket\s*$').hasMatch(header)) {
+        _webSocketActive = true;
+        _framed ??= _FramedSink(this);
+      }
+      if (_webSocketActive) {
         _passThrough();
         return;
       }
@@ -233,7 +243,7 @@ class TunnelSocket implements SSHSocket {
 
   void _deliver(Uint8List d) {
     if (_in.isClosed) return;
-    if (!ws) {
+    if (!_webSocketActive) {
       _in.add(d);
       return;
     }
@@ -318,7 +328,7 @@ class TunnelSocket implements SSHSocket {
   Stream<Uint8List> get stream => _in.stream;
 
   @override
-  StreamSink<List<int>> get sink => ws ? _framed! : _socket;
+  StreamSink<List<int>> get sink => _webSocketActive ? _framed! : _socket;
 
   @override
   Future<void> get done => _socket.done;
@@ -614,6 +624,9 @@ class SshTunnel {
     }
     if (t.toLowerCase().contains('host key') || t.contains('SSHHostkeyError')) {
       return 'Server host key rejected. If you trust the server, reset the pinned key in the profile.';
+    }
+    if (t.contains('SSHAuthAbortError')) {
+      return 'SSH server closed the connection before authentication; check SSH host/port, payload target, WebSocket mode, and server/account status';
     }
     if (e is TimeoutException) return 'SSH handshake timed out';
     return t;

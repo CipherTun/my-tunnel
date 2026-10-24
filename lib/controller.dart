@@ -618,6 +618,7 @@ class VpnController extends ChangeNotifier {
 
   Future<void> _launchXray(String remark, String config, {bool excludeSelf = false}) async {
     _engine = _Engine.xray;
+    _lastV2State = null;
     final c = Completer<void>();
     _up = c;
     final proxyOnly = proxyMode && !excludeSelf;
@@ -637,14 +638,40 @@ class VpnController extends ChangeNotifier {
       await c.future.timeout(const Duration(seconds: 25), onTimeout: () {
         throw 'Tunnel did not come up within 25s';
       });
+    } on TimeoutException {
+      log('Xray did not report a connected state; collecting core diagnostics');
+      await _logXrayCoreLogs();
+      throw 'Tunnel did not come up within 25s (see Xray core log entries above)';
     } finally {
       if (identical(_up, c)) _up = null;
     }
   }
 
+  String? _lastV2State;
+
+  Future<void> _logXrayCoreLogs({int limit = 12}) async {
+    try {
+      final entries = await _v2.getLogs();
+      final start = entries.length > limit ? entries.length - limit : 0;
+      for (final line in entries.skip(start)) {
+        final trimmed = line.trim();
+        if (trimmed.isNotEmpty) log('Xray core: $trimmed');
+      }
+    } catch (e) {
+      log('Could not read Xray core logs: ${errText(e)}');
+    }
+  }
+
   void _onV2(V2RayStatus st) {
     if (_root == null || _engine != _Engine.xray) return;
-    final s = st.state.toString().toUpperCase();
+    final rawState = st.state.toString();
+    final s = rawState.toUpperCase();
+
+    if (_lastV2State != rawState) {
+      _lastV2State = rawState;
+      log('Xray status: $rawState');
+    }
+
     if (s.contains('CONNECTED') && !s.contains('DIS')) {
       _setConnected();
       duration = st.duration;
@@ -654,7 +681,19 @@ class VpnController extends ChangeNotifier {
       downTotal = st.download;
       notifyListeners();
     } else if (s.contains('DISCONNECTED')) {
-      _externalStop();
+      final pending = _up;
+      if (pending != null &&
+          !pending.isCompleted &&
+          state == ConnState.connecting) {
+        unawaited(() async {
+          await _logXrayCoreLogs();
+          if (!pending.isCompleted) {
+            pending.completeError('Xray core disconnected during startup');
+          }
+        }());
+      } else {
+        _externalStop();
+      }
     }
   }
 

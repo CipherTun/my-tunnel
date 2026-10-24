@@ -148,7 +148,6 @@ def patch_gradle():
     g = read(gp) if os.path.exists(gp) else ""
     props = [
         "android.useAndroidX=true",
-        "android.bundle.enableUncompressedNativeLibs=false",
     ]
     # AGP 9 turns on built-in Kotlin and the new DSL, which breaks plugins that
     # still apply `kotlin-android` (flutter_v2ray_client, openvpn_flutter).

@@ -2,7 +2,7 @@ name: Build XRay Vpn
 
 on:
   push:
-    branches: [main, master, dev]
+    branches: [main, master, dev, test/download-xray-vpn-source]
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,25 @@
+name: vpn
+description: XRay Vpn - multi-protocol tunnel client (SSH payload/SNI/WS with UDPGW, Xray, Hysteria2, WireGuard).
+publish_to: "none"
+version: 2.3.0+6
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_v2ray_client: ^3.5.0
+  dartssh2: ^2.9.0
+  shared_preferences: ^2.2.3
+  flutter_secure_storage: ^9.2.2
+  permission_handler: ^11.3.1
+  qr_flutter: ^4.1.0
+  openvpn_flutter: ^2.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

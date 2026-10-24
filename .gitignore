@@ -1,0 +1,11 @@
+# generated in CI by `flutter create` + tools/patch_android.py
+/android/
+/ios/
+/build/
+.dart_tool/
+.flutter-plugins*
+.packages
+pubspec.lock
+*.iml
+.idea/
+.metadata

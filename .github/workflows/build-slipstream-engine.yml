@@ -1,0 +1,91 @@
+name: Build Slipstream Android Engine
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/download-xray-vpn-1
+    paths:
+      - ".github/workflows/build-slipstream-engine.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: armeabi-v7a
+            target: armv7-linux-androideabi
+            linker: armv7a-linux-androideabi24-clang
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+            linker: aarch64-linux-android24-clang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.2.12479018"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Checkout Slipstream Rust source
+        uses: actions/checkout@v4
+        with:
+          repository: Mygod/slipstream-rust
+          ref: main
+          path: slipstream-rust
+          submodules: recursive
+
+      - name: Configure Android linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/${{ matrix.linker }}"
+          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Verify upstream package
+        working-directory: slipstream-rust
+        run: |
+          set -euo pipefail
+          test -s Cargo.toml
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+          cargo package --list --package slipstream-client --allow-dirty > /dev/null
+
+      - name: Build client
+        working-directory: slipstream-rust
+        run: |
+          set -euo pipefail
+          cargo build --locked --release \
+            --package slipstream-client \
+            --target "${{ matrix.target }}"
+
+      - name: Verify and stage binary
+        working-directory: slipstream-rust
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/slipstream-client"
+          test -s "$BIN"
+          file "$BIN"
+          llvm-readelf -h "$BIN"
+          mkdir -p "../slipstream-artifacts/${{ matrix.abi }}"
+          cp "$BIN" "../slipstream-artifacts/${{ matrix.abi }}/slipstream-client"
+          chmod 755 "../slipstream-artifacts/${{ matrix.abi }}/slipstream-client"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slipstream-client-${{ matrix.abi }}
+          path: slipstream-artifacts/${{ matrix.abi }}/
+          if-no-files-found: error
+          retention-days: 14

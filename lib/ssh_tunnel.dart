@@ -81,7 +81,7 @@ class TunnelSocket implements SSHSocket {
   TunnelSocket(this._socket, {required bool expectHeader, bool ws = false})
       : _pass = !expectHeader,
         _ws = ws,
-        _webSocketActive = ws {
+        _webSocketActive = false {
     _framed = _FramedSink(_socket);
     _socket.listen(
       _onData,
@@ -285,8 +285,10 @@ class TunnelSocket implements SSHSocket {
       if (_socksState == 0) {
         if (_buf.length < 2) return;
         final m = _buf.take(2);
-        if (m[0] != 5 || m[1] == 0xff) {
-          _socksFail('SOCKS5 proxy refused the login method');
+        if (m[0] != 5 ||
+            !const [0, 2].contains(m[1]) ||
+            (m[1] == 2 && _sUser.isEmpty)) {
+          _socksFail('SOCKS5 proxy selected an unsupported authentication method');
           return;
         }
         if (m[1] == 2) {
@@ -301,7 +303,7 @@ class TunnelSocket implements SSHSocket {
       if (_socksState == 1) {
         if (_buf.length < 2) return;
         final r = _buf.take(2);
-        if (r[1] != 0) {
+        if (r[0] != 1 || r[1] != 0) {
           _socksFail('SOCKS5 proxy rejected the username/password');
           return;
         }
@@ -310,11 +312,19 @@ class TunnelSocket implements SSHSocket {
       }
       if (_socksState == 2) {
         if (_buf.length < 5) return;
+        if (_buf[0] != 5 || _buf[2] != 0) {
+          _socksFail('SOCKS5 proxy returned a malformed CONNECT response');
+          return;
+        }
         final atyp = _buf[3];
+        if (atyp != 1 && atyp != 3 && atyp != 4) {
+          _socksFail('SOCKS5 proxy returned an unsupported address type');
+          return;
+        }
         final total = atyp == 1 ? 10 : (atyp == 4 ? 22 : 7 + _buf[4]);
         if (_buf.length < total) return;
         final rep = _buf.take(total);
-        if (rep[1] != 0) {
+        if (rep[0] != 5 || rep[2] != 0 || rep[1] != 0) {
           _socksFail('SOCKS5 proxy could not reach the server (reply code ${rep[1]})');
           return;
         }
@@ -394,6 +404,11 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
       await Socket.connect(firstHost, firstPort, timeout: const Duration(seconds: 15));
   sock.setOption(SocketOption.tcpNoDelay, true);
 
+  if (useProxy && o.proxyType == 'socks5' && o.useTls) {
+    sock.destroy();
+    throw 'TLS with an upstream SOCKS5 proxy is not supported by this transport. Disable TLS or use HTTP CONNECT.';
+  }
+
   if (o.useTls) {
     final sni = expandRandomRotate(o.sni.isNotEmpty ? o.sni : o.host);
     log('TLS handshake (SNI: $sni${o.allowInsecure ? '' : ', verified'})');
@@ -401,24 +416,39 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
         host: sni, onBadCertificate: o.allowInsecure ? (_) => true : null);
   }
 
-  if (useProxy && o.proxyType == 'socks5') {
-    final ts = TunnelSocket(sock, expectHeader: false, ws: o.wsFraming);
-    log('SOCKS5 CONNECT ${o.host}:${o.port}');
-    try {
-      await ts.socks5Connect(o.host, o.port, user: o.proxyUser, pass: o.proxyPass);
-    } catch (e) {
-      ts.destroy();
-      rethrow;
-    }
-    return ts;
-  }
-
   var template = o.payload.trim();
-  if (template.isEmpty && useProxy) {
+  if (template.isEmpty && useProxy && o.proxyType != 'socks5') {
     final auth = o.proxyUser.isEmpty
         ? ''
         : 'Proxy-Authorization: Basic ${base64.encode(utf8.encode('${o.proxyUser}:${o.proxyPass}'))}[crlf]';
     template = 'CONNECT [host_port] [protocol][crlf]Host: [host][crlf]$auth[crlf]';
+  }
+
+  if (useProxy && o.proxyType == 'socks5') {
+    final ts = TunnelSocket(sock, expectHeader: template.isNotEmpty, ws: o.wsFraming);
+    log('SOCKS5 CONNECT ${o.host}:${o.port}');
+    try {
+      await ts.socks5Connect(
+        o.host, o.port,
+        user: o.proxyUser,
+        pass: o.proxyPass,
+      );
+      if (template.isNotEmpty) {
+        final chunks = buildPayloadParts(template, host: o.host, port: o.port);
+        log('Sending payload through SOCKS5 (${chunks.length} packet(s))');
+        final line = await ts.sendPayload(chunks);
+        log('Reply: $line');
+        final ok = line.contains(' 101') || line.contains(' 200') || line.startsWith('(');
+        if (!ok || (o.wsFraming && !line.contains(' 101'))) {
+          ts.destroy();
+          throw 'SOCKS5 payload/WebSocket upgrade rejected: $line';
+        }
+      }
+      return ts;
+    } catch (e) {
+      ts.destroy();
+      rethrow;
+    }
   }
 
   final ts = TunnelSocket(sock, expectHeader: template.isNotEmpty, ws: o.wsFraming);
@@ -428,7 +458,7 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
     final line = await ts.sendPayload(chunks);
     log('Reply: $line');
     final ok = line.contains(' 101') || line.contains(' 200') || line.startsWith('(');
-    if (!ok) {
+    if (!ok || (o.wsFraming && !line.contains(' 101'))) {
       ts.destroy();
       throw 'Proxy/server rejected payload: $line';
     }

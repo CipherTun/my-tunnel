@@ -157,7 +157,11 @@ class TunnelSocket implements SSHSocket {
     final statusCode =
         statusParts.length > 1 ? int.tryParse(statusParts[1]) : null;
     if (statusCode == 101 &&
-        RegExp(r'(?im)^upgrade:\s*websocket\s*$').hasMatch(header)) {
+        RegExp(
+      r'^upgrade:\s*websocket\s*$',
+      caseSensitive: false,
+      multiLine: true,
+    ).hasMatch(header)) {
       _webSocketActive = true;
     }
 

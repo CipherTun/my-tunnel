@@ -66,6 +66,7 @@ class VpnController extends ChangeNotifier {
   int _failStreak = 0;
   int _lastCheckDown = -1;
   Completer<void>? _up;
+  String? _lastV2State;
   Map<String, String> _hosts = {};
   final SshTunnel _ssh = SshTunnel();
   late final V2ray _v2 = V2ray(onStatusChanged: _onV2);
@@ -566,7 +567,12 @@ class VpnController extends ChangeNotifier {
     duration = st.duration;
     _account(st.upload, st.download);
     _pushHistory();
-    switch (st.state.toString().toUpperCase()) {
+    final rawState = st.state.trim();
+    if (rawState != _lastV2State) {
+      _lastV2State = rawState;
+      log('Core status: $rawState');
+    }
+    switch (rawState.toUpperCase()) {
       case 'CONNECTED':
         if (state != ConnState.connected) {
           state = ConnState.connected;
@@ -1002,11 +1008,43 @@ class VpnController extends ChangeNotifier {
         bypassSubnets: settings.bypassLan ? lanBypassSubnets : null,
         proxyOnly: settings.proxyOnly,
       );
-      try {
-        await up.future.timeout(const Duration(seconds: 25));
-      } on TimeoutException {
-        log('Core did not report a connected state within 25 seconds; '
+      final deadline = DateTime.now().add(const Duration(seconds: 25));
+      Object? lastProbeError;
+
+      // A missing status event must not be the only reason a working
+      // tunnel is rejected. Verify traffic through the running Xray core.
+      // Never mark connected from service startup alone.
+      while (!up.isCompleted && DateTime.now().isBefore(deadline)) {
+        try {
+          final ms = await _v2
+              .getConnectedServerDelay(url: _testUrl)
+              .timeout(const Duration(seconds: 5));
+
+          if (ms > 0 && !up.isCompleted) {
+            state = ConnState.connected;
+            _retries = 0;
+            log('Tunnel verified by outbound probe (${ms} ms); '
+                'status callback was missing');
+            _startHealth();
+            notifyListeners();
+            up.complete();
+            break;
+          }
+        } catch (e) {
+          lastProbeError = e;
+        }
+
+        if (!up.isCompleted && DateTime.now().isBefore(deadline)) {
+          await Future.delayed(const Duration(seconds: 2));
+        }
+      }
+
+      if (!up.isCompleted) {
+        log('Core did not report connected and the outbound probe did not '
+            'succeed within 25 seconds'
+            '${lastProbeError == null ? '' : ': $lastProbeError'}; '
             'collecting core diagnostics');
+
         final diagnosticLogs = await coreLogs();
         if (diagnosticLogs.isEmpty) {
           log('Core diagnostics are empty or unavailable');
@@ -1018,8 +1056,12 @@ class VpnController extends ChangeNotifier {
             log('Core: $line');
           }
         }
-        throw 'Tunnel did not come up within 25s (see core log entries above)';
+
+        throw 'Tunnel did not connect within 25s '
+            '(see core log entries above)';
       }
+
+      await up.future;
     } finally {
       if (identical(_up, up)) _up = null;
     }

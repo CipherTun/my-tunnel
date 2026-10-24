@@ -455,7 +455,8 @@ Map<String, dynamic> wgToOutbound(
 
     final allowed = csv(peer['allowedips']);
     if (allowed.isEmpty) {
-      throw 'WireGuard peer needs AllowedIPs';
+      // Default to full-tunnel routing when AllowedIPs is omitted.
+      allowed.addAll(['0.0.0.0/0', '::/0']);
     }
 
     final keepAlive = int.tryParse(peer['persistentkeepalive'] ?? '');

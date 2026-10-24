@@ -113,6 +113,7 @@ class TunnelSocket implements SSHSocket {
   int _socksState = -1;
   String _sHost = '', _sUser = '', _sPass = '';
   int _sPort = 0;
+  bool _socksExpectPayloadHeader = false;
 
   void _deliver(Uint8List d) {
     if (!_webSocketActive) {
@@ -255,9 +256,16 @@ class TunnelSocket implements SSHSocket {
   }
 
   /// RFC 1928 CONNECT through an upstream SOCKS5 proxy (RFC 1929 login optional).
-  Future<void> socks5Connect(String host, int port, {String user = '', String pass = ''}) async {
+  Future<void> socks5Connect(
+    String host,
+    int port, {
+    String user = '',
+    String pass = '',
+    bool expectPayloadHeader = false,
+  }) async {
     _socksDone = Completer<void>();
-    _pass = false; // buffer the proxy replies for the handshake, do not hand them to SSH
+    _pass = false;
+    _socksExpectPayloadHeader = expectPayloadHeader;
     _socksState = 0;
     _sHost = host;
     _sPort = port;
@@ -328,9 +336,9 @@ class TunnelSocket implements SSHSocket {
           _socksFail('SOCKS5 proxy could not reach the server (reply code ${rep[1]})');
           return;
         }
-        _pass = true;
+        _pass = !_socksExpectPayloadHeader;
         _socksState = -1;
-        if (_buf.length > 0) _deliver(_buf.take(_buf.length));
+        if (_pass && _buf.length > 0) _deliver(_buf.take(_buf.length));
         c.complete();
       }
     } catch (e) {

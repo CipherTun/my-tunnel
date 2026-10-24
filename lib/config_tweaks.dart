@@ -130,7 +130,10 @@ String applyTweaks(
   m['outbounds'] = outs;
 
   // Block QUIC (UDP/443) so browsers fall back to TCP, which tunnels far better.
-  if (blockQuic) {
+  // Do not block UDP/443 when the selected outbound itself needs UDP/443.
+  final udpBasedProxy = const ['hysteria', 'hysteria2', 'wireguard']
+      .contains(proto);
+  if (blockQuic && !udpBasedProxy) {
     if (!outs.any((o) => o is Map && o['tag'] == 'block')) {
       outs.add({'tag': 'block', 'protocol': 'blackhole'});
     }

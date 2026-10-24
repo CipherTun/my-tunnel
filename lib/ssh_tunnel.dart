@@ -80,7 +80,8 @@ class SshOptions {
 class TunnelSocket implements SSHSocket {
   TunnelSocket(this._socket, {required bool expectHeader, bool ws = false})
       : _pass = !expectHeader,
-        _ws = ws {
+        _ws = ws,
+        _webSocketActive = ws {
     _framed = _FramedSink(_socket);
     _socket.listen(
       _onData,
@@ -99,6 +100,7 @@ class TunnelSocket implements SSHSocket {
 
   final Socket _socket;
   final bool _ws;
+  bool _webSocketActive;
   late final _FramedSink _framed;
   final StreamController<Uint8List> _in = StreamController<Uint8List>();
   final ByteBuf _buf = ByteBuf();
@@ -113,7 +115,7 @@ class TunnelSocket implements SSHSocket {
   int _sPort = 0;
 
   void _deliver(Uint8List d) {
-    if (!_ws) {
+    if (!_webSocketActive) {
       _in.add(d);
       return;
     }
@@ -147,6 +149,18 @@ class TunnelSocket implements SSHSocket {
       return;
     }
     final header = latin1.decode(_buf.take(end + 4), allowInvalid: true);
+
+    // A confirmed WebSocket upgrade means subsequent SSH bytes are framed.
+    // Keep the target branch's existing raw-socket frame sink and parser.
+    final statusLine = header.split('\r\n').first;
+    final statusParts = statusLine.trim().split(RegExp(r'\s+'));
+    final statusCode =
+        statusParts.length > 1 ? int.tryParse(statusParts[1]) : null;
+    if (statusCode == 101 &&
+        RegExp(r'(?im)^upgrade:\s*websocket\s*$').hasMatch(header)) {
+      _webSocketActive = true;
+    }
+
     _pass = true;
     if (_buf.length > 0) _deliver(_buf.take(_buf.length));
     h.complete(header);
@@ -326,7 +340,8 @@ class TunnelSocket implements SSHSocket {
   @override
   Stream<Uint8List> get stream => _in.stream;
   @override
-  StreamSink<List<int>> get sink => _ws ? _framed : _socket;
+  StreamSink<List<int>> get sink =>
+      _webSocketActive ? _framed : _socket;
   @override
   Future<void> get done => _socket.done;
   Future<void> flush() => _socket.flush();

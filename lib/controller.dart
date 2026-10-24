@@ -981,19 +981,39 @@ class VpnController extends ChangeNotifier {
     final up = Completer<void>();
     unawaited(up.future.catchError((Object _) {}));
     _up = up;
-    if (!settings.proxyOnly && !await _v2.requestPermission()) throw 'VPN permission denied';
-    // In SSH mode our own sockets (the SSH connection itself) must NOT be routed
-    // into the VPN, or the tunnel would loop into itself.
-    final apps = <String>{...settings.blockedApps, if (ssh) Native.ownPackage}.toList();
-    await _v2.startV2Ray(
-      remark: remark,
-      config: config,
-      blockedApps: apps.isEmpty ? null : apps,
-      bypassSubnets: settings.bypassLan ? lanBypassSubnets : null,
-      proxyOnly: settings.proxyOnly,
-    );
-    await up.future.timeout(const Duration(seconds: 25),
-        onTimeout: () => throw 'Tunnel did not come up within 25s');
+    try {
+      if (!settings.proxyOnly && !await _v2.requestPermission()) {
+        throw 'VPN permission denied';
+      }
+      // In SSH mode our own sockets (the SSH connection itself) must NOT be routed
+      // into the VPN, or the tunnel would loop into itself.
+      final apps =
+          <String>{...settings.blockedApps, if (ssh) Native.ownPackage}.toList();
+      await _v2.startV2Ray(
+        remark: remark,
+        config: config,
+        blockedApps: apps.isEmpty ? null : apps,
+        bypassSubnets: settings.bypassLan ? lanBypassSubnets : null,
+        proxyOnly: settings.proxyOnly,
+      );
+      try {
+        await up.future.timeout(const Duration(seconds: 25));
+      } on TimeoutException {
+        log('Core did not report a connected state within 25 seconds; '
+            'collecting core diagnostics');
+        final diagnosticLogs = await coreLogs();
+        if (diagnosticLogs.isEmpty) {
+          log('Core diagnostics are empty or unavailable');
+        } else {
+          for (final line in diagnosticLogs.take(40)) {
+            log('Core: $line');
+          }
+        }
+        throw 'Tunnel did not come up within 25s (see core log entries above)';
+      }
+    } finally {
+      if (identical(_up, up)) _up = null;
+    }
   }
 
   @override

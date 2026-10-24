@@ -1011,7 +1011,10 @@ class VpnController extends ChangeNotifier {
         if (diagnosticLogs.isEmpty) {
           log('Core diagnostics are empty or unavailable');
         } else {
-          for (final line in diagnosticLogs.take(40)) {
+          final start = diagnosticLogs.length > 80
+              ? diagnosticLogs.length - 80
+              : 0;
+          for (final line in diagnosticLogs.skip(start)) {
             log('Core: $line');
           }
         }

@@ -1,0 +1,92 @@
+name: Build Official Psiphon Android Engine
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/download-xray-vpn-1
+    paths:
+      - .github/workflows/build-psiphon-engine.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-psiphon:
+    name: Build Psiphon Android Library
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout official Psiphon source
+        uses: actions/checkout@v4
+        with:
+          repository: Psiphon-Labs/psiphon-tunnel-core
+          ref: master
+          path: psiphon-tunnel-core
+
+      - name: Inspect upstream Android build
+        working-directory: psiphon-tunnel-core
+        run: |
+          set -eux
+          test -s LICENSE
+          test -s MobileLibrary/Android/Dockerfile
+          test -s MobileLibrary/Android/make.bash
+          find MobileLibrary/Android -maxdepth 2 -type f -print
+
+      - name: Build official Android build image
+        working-directory: psiphon-tunnel-core
+        run: |
+          docker build \
+            --platform=linux/amd64 \
+            --pull \
+            -t psiphon-android-build \
+            -f MobileLibrary/Android/Dockerfile \
+            .
+
+      - name: Build Psiphon Android library
+        working-directory: psiphon-tunnel-core
+        run: |
+          set -eux
+          docker run \
+            --platform=linux/amd64 \
+            --rm \
+            -v "$PWD:/go/src/github.com/Psiphon-Labs/psiphon-tunnel-core" \
+            -w /go/src/github.com/Psiphon-Labs/psiphon-tunnel-core/MobileLibrary/Android \
+            psiphon-android-build \
+            /bin/bash -lc './make.bash'
+
+      - name: Locate and verify Android libraries
+        working-directory: psiphon-tunnel-core
+        run: |
+          set -eux
+          find MobileLibrary/Android -type f \
+            \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) -print
+
+          mkdir -p "$RUNNER_TEMP/psiphon-artifacts"
+
+          find MobileLibrary/Android -type f \
+            \( -name '*.aar' -o -name '*.jar' -o -name '*.so' \) \
+            -exec cp --parents '{}' "$RUNNER_TEMP/psiphon-artifacts/" \;
+
+          test -n "$(find "$RUNNER_TEMP/psiphon-artifacts" \
+            -type f -name '*.aar' -print -quit)" || {
+              echo "ERROR: No Android AAR was produced."
+              exit 1
+            }
+
+          find "$RUNNER_TEMP/psiphon-artifacts" -type f -name '*.aar' \
+            -exec sh -c '
+              for aar do
+                echo "Inspecting $aar"
+                unzip -l "$aar"
+              done
+            ' sh '{}' +
+
+      - name: Upload official Psiphon build outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-psiphon-android
+          path: ${{ runner.temp }}/psiphon-artifacts/
+          if-no-files-found: error
+          retention-days: 14

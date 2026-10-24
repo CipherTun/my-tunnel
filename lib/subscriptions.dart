@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'models.dart';
 
 /// Downloads a subscription body (max 5 MB, 20 s).

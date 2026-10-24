@@ -740,8 +740,8 @@ class VpnController extends ChangeNotifier {
     if (stage.isDisconnected) _externalStop();
   }
 
-  void _onOvpnStatus(VpnStatus st) {
-    if (_root == null || _engine != _Engine.ovpn || state != ConnState.connected) return;
+  void _onOvpnStatus(VpnStatus? st) {
+    if (st == null || _root == null || _engine != _Engine.ovpn || state != ConnState.connected) return;
     final d = st.duration;
     if (d != null && d.isNotEmpty) duration = d;
     downTotal = int.tryParse('${st.byteIn}') ?? downTotal;

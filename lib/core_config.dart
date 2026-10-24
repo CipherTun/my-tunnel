@@ -128,42 +128,6 @@ String buildV2rayConfig(Profile p) {
 String buildSocksConfig(int port) => V2ray.parseFromURL('socks://127.0.0.1:$port#SSH').getFullConfiguration();
 
 /// HTTP / HTTPS / SOCKS5 upstream proxy as an Xray outbound.
-String buildProxyConfig(Profile p) {
-  final d = p.data;
-  final kind = _s(d, 'kind', 'socks5');
-  final host = _s(d, 'host');
-  final port = int.tryParse(_s(d, 'port')) ?? (kind == 'socks5' ? 1080 : 8080);
-  final user = _s(d, 'user');
-  if (host.isEmpty) throw 'Proxy host is empty';
-  final m = _template('socks://127.0.0.1:10809#PX');
-  final out = <String, dynamic>{
-    'tag': 'proxy',
-    'protocol': kind == 'socks5' ? 'socks' : 'http',
-    'settings': {
-      'servers': [
-        {
-          'address': host,
-          'port': port,
-          if (user.isNotEmpty)
-            'users': [
-              {'user': user, 'pass': (d['pass'] ?? '').toString()}
-            ],
-        }
-      ],
-    },
-    if (kind == 'https')
-      'streamSettings': {
-        'network': 'tcp',
-        'security': 'tls',
-        'tlsSettings': {'serverName': _s(d, 'sni').isEmpty ? host : _s(d, 'sni')},
-      },
-  };
-  final outs = (m['outbounds'] as List).toList();
-  outs[0] = out;
-  m['outbounds'] = outs;
-  return jsonEncode(m);
-}
-
 String buildWireGuardConfig(Profile p) {
   final conf = _s(p.data, 'conf');
   final iface = <String, String>{};

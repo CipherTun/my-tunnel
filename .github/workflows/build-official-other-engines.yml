@@ -1,0 +1,101 @@
+name: Build official OpenVPN and OpenConnect sources
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openvpn3:
+    name: Build official OpenVPN 3 Core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+
+      - name: Checkout official OpenVPN 3 source
+        uses: actions/checkout@v4
+        with:
+          repository: OpenVPN/openvpn3
+          ref: master
+          path: official-openvpn3
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates cmake g++ git iproute2 ninja-build \
+            pkg-config libasio-dev libcap-dev libfmt-dev \
+            liblz4-dev libjsoncpp-dev libssl-dev libxxhash-dev
+
+      - name: Configure and build official source
+        working-directory: official-openvpn3
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -GNinja
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+
+      - name: Preserve upstream source and build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-openvpn3-source-build
+          path: |
+            official-openvpn3/
+          if-no-files-found: error
+          retention-days: 7
+
+  openconnect:
+    name: Build official OpenConnect source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+
+      - name: Download official OpenConnect release
+        run: |
+          set -euo pipefail
+          mkdir -p official-openconnect
+          curl --fail --location --retry 3 \
+            https://www.infradead.org/openconnect/download/openconnect-9.21.tar.gz \
+            -o openconnect.tar.gz
+          tar -xzf openconnect.tar.gz \
+            --strip-components=1 -C official-openconnect
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config \
+            libxml2-dev libssl-dev zlib1g-dev liblz4-dev gettext
+
+      - name: Configure and build official source
+        working-directory: official-openconnect
+        run: |
+          set -euo pipefail
+          ./configure \
+            --prefix="$RUNNER_TEMP/openconnect-install" \
+            --with-openssl --without-gnutls --disable-nls
+          make -j2
+          make check
+          make install
+          test -s "$RUNNER_TEMP/openconnect-install/bin/openconnect"
+          find "$RUNNER_TEMP/openconnect-install/lib" \
+            -maxdepth 1 -name 'libopenconnect.so*' \
+            -print -quit | grep -q .
+
+      - name: Upload OpenConnect build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-openconnect-source-build
+          path: |
+            official-openconnect/
+            ${{ runner.temp }}/openconnect-install/
+          if-no-files-found: error
+          retention-days: 7

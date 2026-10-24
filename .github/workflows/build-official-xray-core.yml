@@ -1,0 +1,115 @@
+name: Build official Xray engine (libXray)
+
+on:
+  workflow_dispatch:
+    inputs:
+      libxray_tag:
+        description: Official XTLS/libXray release tag
+        required: true
+        default: v26.10.21
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Build official libXray Android AAR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      NDK_VERSION: r30
+
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+
+      - name: Validate release tag
+        shell: bash
+        env:
+          LIBXRAY_TAG: ${{ inputs.libxray_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$LIBXRAY_TAG" =~ ^v[0-9]{2}\.[0-9]{1,2}\.[0-9]{1,2}$ ]] || {
+            echo "Invalid official libXray release tag: $LIBXRAY_TAG"
+            exit 1
+          }
+
+      - name: Checkout official XTLS/libXray
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/libXray
+          ref: ${{ inputs.libxray_tag }}
+          path: official-libxray
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Build using the official libXray builder
+        working-directory: official-libxray
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          python3 build/main.py android
+          test -s libXray.aar
+          test -s libXray-sources.jar
+
+      - name: Verify AAR and required ARM ABIs
+        working-directory: official-libxray
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p aar-check
+          unzip -q libXray.aar -d aar-check
+          test -s aar-check/classes.jar
+
+          echo "Native libraries found:"
+          find aar-check -type f -name '*.so' -print | sort
+
+          for abi in armeabi-v7a arm64-v8a; do
+            if ! find "aar-check/jni/$abi" -type f -name '*.so' \
+                -print -quit 2>/dev/null | grep -q .; then
+              echo "ERROR: AAR is missing native libraries for $abi"
+              exit 1
+            fi
+          done
+
+          sha256sum libXray.aar libXray-sources.jar
+          echo "Both required ARM ABIs verified."
+
+      - name: Upload official engine build
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-libxray-${{ inputs.libxray_tag }}-android
+          path: |
+            official-libxray/libXray.aar
+            official-libxray/libXray-sources.jar
+          if-no-files-found: error
+          retention-days: 14

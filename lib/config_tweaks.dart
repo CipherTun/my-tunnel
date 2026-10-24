@@ -391,44 +391,111 @@ class _SysRandom implements _Rng {
 
 _Rng _fallbackRandom() => _SysRandom();
 
-Map<String, dynamic> wgToOutbound(String conf) {
+Map<String, dynamic> wgToOutbound(
+  String conf, {
+  List<String> remoteDns = const [],
+}) {
   final iface = <String, String>{};
-  final peer = <String, String>{};
-  var sec = '';
-  for (var line in conf.split('\n')) {
-    line = line.split('#').first.trim();
+  final peers = <Map<String, String>>[];
+  Map<String, String>? currentPeer;
+  var section = '';
+
+  for (final raw in conf.split('\n')) {
+    final line = raw.split('#').first.trim();
     if (line.isEmpty) continue;
-    if (line.startsWith('[')) {
-      sec = line.toLowerCase();
+
+    if (line.startsWith('[') && line.endsWith(']')) {
+      section = line.toLowerCase();
+      if (section == '[interface]') {
+        currentPeer = null;
+      } else if (section == '[peer]') {
+        currentPeer = <String, String>{};
+        peers.add(currentPeer);
+      } else {
+        currentPeer = null;
+      }
       continue;
     }
+
     final i = line.indexOf('=');
-    if (i < 0) continue;
-    (sec == '[peer]' ? peer : iface)[line.substring(0, i).trim().toLowerCase()] =
-        line.substring(i + 1).trim();
+    if (i < 1) continue;
+    final key = line.substring(0, i).trim().toLowerCase();
+    final value = line.substring(i + 1).trim();
+
+    if (section == '[interface]') {
+      iface[key] = value;
+    } else if (section == '[peer]' && currentPeer != null) {
+      currentPeer[key] = value;
+    }
   }
-  List<String> list(String? s) =>
-      (s ?? '').split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-  if (iface['privatekey'] == null || peer['publickey'] == null || peer['endpoint'] == null) {
-    throw 'WireGuard config needs PrivateKey, PublicKey and Endpoint';
+
+  List<String> csv(String? value) => (value ?? '')
+      .split(',')
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
+
+  final privateKey = iface['privatekey'];
+  final addresses = csv(iface['address']);
+  if (privateKey == null || privateKey.isEmpty || addresses.isEmpty) {
+    throw 'WireGuard config needs PrivateKey and Address';
   }
+  if (peers.isEmpty) {
+    throw 'WireGuard config needs at least one [Peer] section';
+  }
+
+  final parsedPeers = <Map<String, dynamic>>[];
+  for (final peer in peers) {
+    final publicKey = peer['publickey'];
+    final endpoint = peer['endpoint'];
+    if (publicKey == null || publicKey.isEmpty ||
+        endpoint == null || endpoint.isEmpty) {
+      throw 'Every WireGuard peer needs PublicKey and Endpoint';
+    }
+
+    final allowed = csv(peer['allowedips']);
+    if (allowed.isEmpty) {
+      throw 'WireGuard peer needs AllowedIPs';
+    }
+
+    final keepAlive = int.tryParse(peer['persistentkeepalive'] ?? '');
+    parsedPeers.add({
+      'publicKey': publicKey,
+      'endpoint': endpoint,
+      'allowedIPs': allowed,
+      if ((peer['presharedkey'] ?? '').isNotEmpty)
+        'preSharedKey': peer['presharedkey'],
+      if (keepAlive != null && keepAlive >= 0) 'keepAlive': keepAlive,
+    });
+  }
+
+  final dns = <String>[];
+  for (final item in [
+    ...csv(iface['dns']),
+    ...remoteDns.map((e) => e.trim()),
+  ]) {
+    if (item.isNotEmpty && !dns.contains(item)) dns.add(item);
+  }
+
+  final reserved = csv(iface['reserved'])
+      .map(int.tryParse)
+      .toList();
+  if (reserved.any((value) => value == null || value < 0 || value > 255)) {
+    throw 'WireGuard Reserved must contain byte values from 0 to 255';
+  }
+
+  final mtu = int.tryParse(iface['mtu'] ?? '');
   return {
     'tag': 'proxy',
     'protocol': 'wireguard',
     'settings': {
-      'secretKey': iface['privatekey'],
-      'address': list(iface['address']),
-      'peers': [
-        {
-          'publicKey': peer['publickey'],
-          if (peer['presharedkey'] != null) 'preSharedKey': peer['presharedkey'],
-          'endpoint': peer['endpoint'],
-          'allowedIPs':
-              peer['allowedips'] == null ? ['0.0.0.0/0', '::/0'] : list(peer['allowedips']),
-          'keepAlive': int.tryParse(peer['persistentkeepalive'] ?? '') ?? 25,
-        }
-      ],
-      'mtu': int.tryParse(iface['mtu'] ?? '') ?? 1280,
+      'secretKey': privateKey,
+      'address': addresses,
+      'peers': parsedPeers,
+      'noKernelTun': true,
+      if (dns.isNotEmpty) 'remoteDNS': dns,
+      if (reserved.isNotEmpty) 'reserved': reserved.cast<int>(),
+      if (mtu != null && mtu > 0) 'mtu': mtu,
     },
   };
 }

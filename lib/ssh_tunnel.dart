@@ -440,6 +440,7 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
         o.host, o.port,
         user: o.proxyUser,
         pass: o.proxyPass,
+        expectPayloadHeader: template.isNotEmpty,
       );
       if (template.isNotEmpty) {
         final chunks = buildPayloadParts(template, host: o.host, port: o.port);

@@ -96,7 +96,7 @@ String buildChainConfig(Profile entry, Profile exit, AppSettings s) {
 }
 
 String buildWireguardConfig(String conf, AppSettings s) =>
-    _finish(patchDns(_withOutbound(wgToOutbound(conf)), s), s, s.socksPort);
+    _finish(patchDns(_withOutbound(wgToOutbound(conf, remoteDns: s.dnsServers)), s), s, s.socksPort);
 
 /// Xray config that forwards everything to our local SOCKS5 server (SSH mode).
 String buildSocksConfig(int port, AppSettings s) {

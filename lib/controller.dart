@@ -603,6 +603,10 @@ class VpnController extends ChangeNotifier {
   void _onOvpnStage(ovpn.VPNStage stage, String raw) {
     if (_root == null || !_ovpnActive) return;
     final r = raw.toLowerCase();
+    final stageName = stage.toString().split('.').last.toLowerCase();
+    final failed = RegExp(
+      r'auth_failed|auth-failed|authentication failed|denied|error|failed|failure',
+    ).hasMatch('$stageName $r');
     if (stage.isConnected) {
       if (state != ConnState.connected) {
         state = ConnState.connected;
@@ -611,12 +615,14 @@ class VpnController extends ChangeNotifier {
       }
       final u = _ovpnUp;
       if (u != null && !u.isCompleted) u.complete();
-    } else if (r == 'auth_failed' || r == 'denied' || r == 'error') {
-      final why = r == 'auth_failed'
+    } else if (failed) {
+      final why = RegExp(
+        r'auth_failed|auth-failed|authentication failed',
+      ).hasMatch('$stageName $r')
           ? 'OpenVPN authentication failed (check username / password / certificate)'
-          : r == 'denied'
+          : RegExp(r'denied').hasMatch('$stageName $r')
               ? 'VPN permission denied'
-              : 'OpenVPN error';
+              : 'OpenVPN error: ${raw.isEmpty ? stageName : raw}';
       final u = _ovpnUp;
       if (u != null && !u.isCompleted) {
         u.completeError(why);

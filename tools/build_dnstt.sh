@@ -19,10 +19,11 @@ command -v go >/dev/null || { echo "ERROR: Go is not installed"; exit 1; }
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# The upstream bamsoftware.com Git server does not support shallow clones.
+git clone "$SRC" "$WORK/dnstt"
+
 if [ -n "$REF" ]; then
-  git clone --depth 1 --branch "$REF" "$SRC" "$WORK/dnstt"
-else
-  git clone --depth 1 "$SRC" "$WORK/dnstt"
+  git -C "$WORK/dnstt" checkout "$REF"
 fi
 echo "dnstt commit: $(git -C "$WORK/dnstt" rev-parse HEAD)"
 go version

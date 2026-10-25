@@ -56,15 +56,26 @@ jobs:
           NDK="$ANDROID_HOME/ndk/27.2.12479018"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           test -x "$TOOLCHAIN/${{ matrix.linker }}"
+          test -x "$TOOLCHAIN/llvm-ar"
+          test -x "$TOOLCHAIN/llvm-ranlib"
+
+          # Vendored OpenSSL may call target-prefixed binutils.
+          ln -sf "$TOOLCHAIN/llvm-ar" "$TOOLCHAIN/arm-linux-androideabi-ar"
+          ln -sf "$TOOLCHAIN/llvm-ranlib" "$TOOLCHAIN/arm-linux-androideabi-ranlib"
+          ln -sf "$TOOLCHAIN/llvm-ar" "$TOOLCHAIN/aarch64-linux-android-ar"
+          ln -sf "$TOOLCHAIN/llvm-ranlib" "$TOOLCHAIN/aarch64-linux-android-ranlib"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
           echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
           case "${{ matrix.target }}" in
             armv7-linux-androideabi)
               echo "CC_armv7_linux_androideabi=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
               echo "AR_armv7_linux_androideabi=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+              echo "RANLIB_armv7_linux_androideabi=$TOOLCHAIN/llvm-ranlib" >> "$GITHUB_ENV"
               ;;
             aarch64-linux-android)
               echo "CC_aarch64_linux_android=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
               echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+              echo "RANLIB_aarch64_linux_android=$TOOLCHAIN/llvm-ranlib" >> "$GITHUB_ENV"
               ;;
           esac
 

@@ -65,7 +65,7 @@ jobs:
             -v "$PWD:/go/src/github.com/Psiphon-Labs/psiphon-tunnel-core" \
             -w /go/src/github.com/Psiphon-Labs/psiphon-tunnel-core/MobileLibrary/Android \
             psiphon-android-build \
-            /bin/bash -lc './make.bash'
+            /bin/bash -lc 'git config --global --add safe.directory /go/src/github.com/Psiphon-Labs/psiphon-tunnel-core && ./make.bash'
 
       - name: Locate and verify Android libraries
         working-directory: psiphon-tunnel-core

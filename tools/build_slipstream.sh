@@ -29,6 +29,17 @@ export PATH="$TOOLCHAIN:$PATH"
 export ANDROID_NDK_HOME="$NDK"
 export ANDROID_PLATFORM="android-23"
 
+# Make the runner's system OpenSSL discoverable by Picoquic's CMake build.
+# The vendored Rust OpenSSL feature does not guarantee that Picoquic's
+# separate CMake build can locate libcrypto.
+if command -v pkg-config >/dev/null 2>&1; then
+  export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}"
+fi
+export OPENSSL_ROOT_DIR="/usr"
+export OPENSSL_INCLUDE_DIR="/usr/include"
+export OPENSSL_CRYPTO_LIBRARY="/usr/lib/x86_64-linux-gnu/libcrypto.so"
+export CMAKE_PREFIX_PATH="/usr${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+
 build_one() {
   local abi="$1" target="$2" linker="$3" cargo_suffix="$4"
   echo "========== Slipstream $abi ($target) =========="

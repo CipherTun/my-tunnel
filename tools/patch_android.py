@@ -145,11 +145,21 @@ for path in files:
         f.write(t)
 
     if "libs/libXray.aar" not in t:
-        dep = '    implementation(files("libs/libXray.aar"))\n' if kts else "    implementation files('libs/libXray.aar')\n"
-        t2, n = re.subn(r"(?m)^(\s*dependencies\s*\{[^\n]*\n)", lambda m: m.group(1) + dep, t, count=1)
-        if n != 1:
-            raise SystemExit(f"ERROR: Could not add LibXray AAR dependency in {path}")
-        t = t2
+        # Flutter-generated Gradle Kotlin DSL may have no dependencies block.
+        dep_line = (
+            '    implementation(files("libs/libXray.aar"))\n'
+            if kts
+            else "    implementation files('libs/libXray.aar')\n"
+        )
+        match = re.search(r"(?m)^[ \t]*dependencies[ \t]*\{[^\n]*\n", t)
+        if match:
+            t = t[:match.end()] + dep_line + t[match.end():]
+        else:
+            dep_block = "dependencies {\n" + dep_line + "}\n"
+            t = t.rstrip() + "\n\n" + dep_block
+
+        if "libs/libXray.aar" not in t:
+            raise SystemExit(f"ERROR: Failed to add LibXray AAR dependency in {path}")
 
     if PKG not in t:
         raise SystemExit(f"ERROR: {PKG} was not applied in {path}")

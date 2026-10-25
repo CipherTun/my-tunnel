@@ -173,6 +173,13 @@ jobs:
         run: |
           set -euo pipefail
           NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          test -f "$NDK/build/cmake/android.toolchain.cmake"
+
+          # Pass the exact NDK and ABI to Picoquic's CMake build.
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_ABI=${{ matrix.abi }}" >> "$GITHUB_ENV"
+          echo "ANDROID_PLATFORM=android-24" >> "$GITHUB_ENV"
+
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           test -x "$TOOLCHAIN/${{ matrix.linker }}"
           test -x "$TOOLCHAIN/llvm-ar"
@@ -212,7 +219,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --release \
             --package slipstream-client \
-            --features openssl-vendored \
+            --features "openssl-vendored,picoquic-minimal-build" \
             --target "${{ matrix.target }}"
 
       - name: Verify and stage binary

@@ -1,102 +1,58 @@
-# XRay Vpn  (`xyz.xray.vpn`)
+# XRay Vpn 2.4.0
 
-Android tunnel client built with Flutter. One app, seven profile types:
+Flutter VPN client with a native Android VPN service. The app keeps its existing Material UI, saved profiles, subscriptions, themes, settings, SSH payload tools, OpenVPN integration, usage history, and diagnostics while replacing `flutter_v2ray_client` with the official XTLS LibXray engine.
 
-| Profile | What it does |
+## Supported connection types
+
+| Type | Real implementation |
 |---|---|
-| **SSH Tunnel** | SSH over plain TCP, HTTP proxy + custom payload, TLS/SNI wrapper, WebSocket upgrade/framing. Local SOCKS5 server feeds the Xray TUN core. **TCP and UDP** (UDP through `badvpn-udpgw`). |
-| **V2Ray / Xray / Hysteria2** | VMess, VLESS (incl. REALITY, XHTTP), Trojan, Shadowsocks, SOCKS, Hysteria2 via share links, manual form, or raw Xray JSON. |
-| **Proxy** | HTTP, HTTPS (TLS, SNI, certificate pinning) or SOCKS5 upstream with login and custom request headers (Xray `http` / `socks` outbounds, flat format of the current docs). |
-| **WireGuard** | Paste a wg-quick config, run through the Xray core. |
-| **OpenVPN** | Paste a `.ovpn` (UDP/TCP, user/pass, encrypted keys). Real OpenVPN 2.7 engine (ics-openvpn) via `openvpn_flutter`. |
-| **Proxy chain** | entry → exit, two TCP-based Xray profiles chained with `sockopt.dialerProxy`. |
-| **Failover group** | Tries members in order; can be sorted by measured latency. |
+| **Xray / V2Ray** | Official LibXray: VLESS (including REALITY and XHTTP where supported by current Xray), VMess AEAD, Trojan, Shadowsocks, SOCKS, Hysteria2, share links and raw Xray JSON. |
+| **WireGuard** | Xray's native WireGuard outbound generated from a wg-quick config. |
+| **SSH Tunnel** | `dartssh2`, payload injection, TLS/SNI, optional WebSocket framing, host-key pinning and SOCKS5 local proxy. |
+| **UDP over SSH** | Existing SOCKS5 UDP ASSOCIATE and badvpn-udpgw packet forwarding; the server must run `badvpn-udpgw`. |
+| **DNSTT / SlowDNS** | Official `dnstt-client` executable, either as a transport for SSH or as a direct TCP tunnel to a server-side SOCKS endpoint. UDP, DoH and DoT resolver modes are available. |
+| **Slipstream** | Upstream Rust `slipstream-client` executable; resolver or authoritative mode, optional strict certificate pinning, routed through a server-side SOCKS endpoint. |
+| **OpenVPN** | Existing `openvpn_flutter` / ics-openvpn engine for `.ovpn` profiles. |
+| **OpenConnect / AnyConnect** | Profile editor and controller contract are present; native OpenConnect Android service is not packaged yet and connection attempts fail explicitly. |
+| **Psiphon** | Profile editor and isolated-engine bridge contract are present; official Psiphon Android service is not packaged yet and connection attempts fail explicitly. |
+| **HTTP / HTTPS / SOCKS5 proxy** | Xray outbound with optional credentials, TLS/SNI and headers. |
+| **Proxy chain / failover group** | Existing Xray TCP chain and ordered profile failover. |
 
-All networking is real: the TUN/VPN service and protocol cores come from `flutter_v2ray_client`
-(Xray core), SSH from `dartssh2`.
+The Android build uses four ABI targets: `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`. The CI workflow downloads the official LibXray `v26.10.21` Android AAR and verifies its SHA-256, then builds DNSTT and Slipstream native executables for all four ABIs.
 
-## What is new in 2.3
+## LibXray architecture
 
-* **New interface**: Material 3 with bottom navigation (Home, Servers, Tools, Settings). Home has one connect
-  button, live speed tiles and a throughput chart drawn from real per-second samples, diagnostics (latency, exit IP,
-  speed test) and data used. Servers has search, type filters, subscription sections, swipe-to-delete and
-  one-tap "connect to the fastest". Settings save as you change them.
-* **Proxy profiles** (HTTP / HTTPS / SOCKS5) and an **upstream SOCKS5 proxy for SSH** (with login), next to the
-  existing HTTP-proxy/payload/SNI/WebSocket options.
-* **Payload engine**: full HTTP Injector tag set (`[raw]`, `[method]`, `[ssh]`, `[lfcr]`, `[crlf*2]`, split / delay split /
-  instant split with real pauses), a new generator (normal, front/back inject, front/back query, dual CONNECT, raw,
-  rotating front hosts) and a **Test connection** button in the SSH editor that checks proxy + payload + SNI and reads
-  the SSH banner.
-* **Proxy-only mode** (no VPN service): SSH-backed SOCKS5 or Xray local proxy, with live stats.
-* **Connect to the fastest server**, Xray **log level**, global error log, storage errors surfaced in the log.
-* **Fixes**: Xray's own inbound could share the SSH local SOCKS port (now separated and pinned); SOCKS5-upstream
-  handshake replies were handed to the SSH layer instead of the handshake (fixed).
+- `tools/native/XrayVpnService.kt` owns the Android TUN interface and runs in the isolated `:xray` process.
+- The TUN file descriptor is passed to LibXray through the documented root `env.xray.tun.fd` config value.
+- Android socket protection is registered with LibXray so Xray's own outbound sockets do not loop back into the VPN.
+- `lib/core_config.dart` delegates share-link parsing to LibXray and retains the app's DNS, inbound-port, fragment, Mux and routing tweaks.
+- The standalone DNSTT and Slipstream executables run as child processes, not as separate Go libraries in the LibXray process.
 
-## What is new in 2.2
+LibXray's public API is not guaranteed stable, so its release is pinned in `.github/workflows/build.yml`. The workflow runs Flutter analysis and tests, builds separate release APKs for `armeabi-v7a`, `arm64-v8a`, `x86`, and `x86_64`, verifies native engine packaging, and uploads each ABI as its own artifact.
 
-* **OpenVPN** profiles (new protocol, real engine) and **proxy chains**.
-* **CDN clean-IP scanner** (TCP+TLS handshake probe, loads Cloudflare's published ranges) and a per-profile
-  **connect-address override** (dial the fast IP, keep SNI/Host).
-* **Speed test** through the tunnel (also works in SSH mode), **data-usage history** (today / 7 / 30 days, per profile).
-* **Block QUIC (UDP 443)** and **uTLS fingerprint override** for Xray profiles.
-* **Open links from other apps**: `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, `hy2://` deep links,
-  plus a clipboard prompt when a share link is copied.
-* Auto-refresh of subscriptions, sort profiles by latency, SSH-server setup guide (badvpn-udpgw).
-* **Bug fix found while researching:** the TLS-fragment helper outbound used a `domainStrategy` field that Xray
-  26.9 moved into `sockopt`; it is removed.
+## Build in GitHub Actions
 
-## What was new in 2.1
+The workflow creates the Android shell and applies the app's package ID (`xyz.xray.vpn`) using `tools/patch_android.py`. It then downloads the pinned LibXray AAR, builds DNSTT and Slipstream, runs:
 
-* Renamed to **XRay Vpn**, application id / namespace **`xyz.xray.vpn`** (CI generates `android/` with
-  `--org xyz.xray --project-name vpn` and `tools/patch_android.py` enforces and verifies it).
-* **UDP over SSH** (badvpn-udpgw protocol, verified against badvpn's `udpgw.c` / `packetproto.h`):
-  SOCKS5 UDP ASSOCIATE implemented in `LocalSocks`. Needs `badvpn-udpgw --listen-addr 127.0.0.1:7300` on the server.
-* **SSH host-key pinning** (trust on first use; a changed key is refused).
-* **Subscriptions** (plain or base64 lists, refresh, per-subscription profiles).
-* **Latency tests** per profile (real core delay test / TCP connect for SSH), failover sorting.
-* **Live stats** (speed, totals, duration), in-tunnel delay test, exit-IP check.
-* **Health check** that detects "connected but dead" tunnels and reconnects.
-* **Xray TLS fragment + Mux** options (per Xray freedom-outbound docs).
-* **App picker** for apps that bypass the VPN, via a small native bridge (`tools/native/MainActivity.kt`).
-* **Credentials in Android Keystore-backed secure storage** (auto-migrated from the old plaintext prefs).
-* QR code export, full backup/restore, theme setting, auto-connect, battery-optimisation + Always-on/kill-switch shortcuts.
-* Optional SOCKS username/password when sharing over hotspot.
-* Unit tests for the udpgw codec, payload engine, config tweaks, subscriptions, importers.
-
-## Bugs fixed from the previous source
-
-* **SSH loop:** in SSH mode this app's own sockets were routed back into the VPN. The app is now always
-  excluded in SSH mode.
-* Notification permission (Android 13+) was never requested, so the foreground notification was hidden.
-* Race / null-deref on the tunnel-up completer; duplicate reconnect timers when both SSH and the core reported a drop.
-* Orphaned VPN service after the activity was destroyed is stopped on start; Back now moves the app to the
-  background while connected instead of destroying it (which would kill the Dart-hosted SSH tunnel).
-* SSH accepted any host key; WebSocket framing used O(n²) buffer handling; `@override` on a non-interface member.
-* Hysteria/SSH TLS options: certificate verification can now be turned on (default stays permissive for fronting).
-
-## Build
-
-CI (`.github/workflows/build.yml`) does everything: `flutter create`, `patch_android.py`, `analyze`, `test`,
-release APK (arm, arm64, x64). Locally:
-
+```bash
+python3 tools/fix_regex_flags.py
+flutter pub get
+flutter analyze --no-fatal-infos --no-fatal-warnings
+flutter test
+flutter build apk --release --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x86,android-x64
 ```
-flutter create --platforms=android --org xyz.xray --project-name vpn .
-python3 tools/patch_android.py
-flutter pub get && flutter test && flutter build apk --release
-```
-The APK is debug-signed by default; add your own signing config for distribution.
 
-## Known limitations
+No local Gradle wrapper is required. Release APKs are debug-signed unless a release signing configuration is added separately.
 
-* The SSH tunnel runs in the app's Dart isolate. Swiping the app away from Recents stops it (use Back / Home).
-* "Only these apps use the VPN" is not offered: the plugin only supports a bypass list.
-* Not included, because each needs a native engine that cannot be faked or safely mixed in blind:
-  TUIC, AnyTLS, NaiveProxy, Hysteria v1, ShadowsocksR (sing-box core; a second Go engine next to Xray risks
-  native-library clashes), DNSTT/SlowDNS, Psiphon, Tor. WireGuard and Hysteria2 are covered by the Xray core.
-* OpenVPN profiles are not covered by the SSH-only features (UDP gateway, host pinning, fragment, Mux).
+## Important boundaries
 
-## Licence note
+- DNSTT and Slipstream need a compatible server-side TCP destination. For the standalone VPN profile, that destination must speak SOCKS; the client-side TCP listener is a transport, not itself a SOCKS server.
+- Slipstream's certificate field is optional. Supplying the server's PEM leaf certificate enables strict leaf pinning; without it, the upstream client's legacy/no-verification behavior may apply.
+- OpenConnect and Psiphon are selectable profile types with dedicated edit forms and controller dispatch, but their native engines are **not yet integrated**. Their connection handlers intentionally return an explicit integration error rather than faking a connection. See `docs/ENGINE-INTEGRATION.md` for the precise native contracts and process-isolation requirements.
+- BoringTun's current build output is a Rust library artifact, not an Android-ready VPN service. WireGuard remains available through Xray's native outbound; no unusable `.rlib` is shipped in the APK.
+- The hotspot option exposes the local proxy on the LAN where supported; it does not by itself guarantee that Android hotspot clients' traffic is routed through the phone's VPN. Rootless system-wide hotspot forwarding needs a separate routing implementation.
+- `openvpn_flutter` and its ics-openvpn engine are GPLv3. Distributing an app that bundles it requires GPL-compatible distribution and source obligations.
 
-`openvpn_flutter` and its ics-openvpn engine are **GPLv3**. An app that bundles them must be distributed under
-GPL-compatible terms with source available. Remove the OpenVPN profile type (and that dependency) if you need a
-different licence.
+## Tests
+
+Unit tests cover payload handling, DNS tunnel argument validation, UDPGW framing, profile serialization, subscription parsing, configuration tweaks and Slipstream CLI construction. A successful CI build confirms compilation and packaging, not successful connectivity to a particular server; each tunnel must be tested against a correctly configured server.

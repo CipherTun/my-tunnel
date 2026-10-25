@@ -4,7 +4,8 @@ Does, in order:
   * forces app id / namespace to xyz.xray.vpn and the launcher label to "XRay Vpn"
   * adds permissions + <queries> (needed for the app picker)
   * minSdk 23 + legacy native-library packaging (Xray core ships .so files)
-  * installs our MainActivity (tools/native/MainActivity.kt) at the right path
+  * installs MainActivity and the isolated LibXray VPN service
+  * links the official LibXray AAR downloaded by the build workflow
   * writes a launcher icon, removes the default widget test
 """
 import glob
@@ -35,6 +36,9 @@ for perm in (
     "FOREGROUND_SERVICE",
     "POST_NOTIFICATIONS",
     "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+    # Android 14+: a foreground service with a declared type needs the matching
+    # permission, otherwise startForeground() throws and the VPN service dies.
+    "FOREGROUND_SERVICE_SPECIAL_USE",
 ):
     tag = f"android.permission.{perm}"
     if tag not in s:
@@ -59,14 +63,20 @@ if "android:scheme=\"vless\"" not in s:
         '                <category android:name="android.intent.category.BROWSABLE"/>\n'
         + "".join(
             f'                <data android:scheme="{sch}"/>\n'
-            for sch in ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2")
+            for sch in ("vless", "vmess", "trojan", "ss", "hysteria2", "hy2", "dnstt", "slipstream")
         )
         + "            </intent-filter>\n"
     )
     i = s.find("</activity>")
-    if i < 0:
-        raise SystemExit("ERROR: </activity> not found in the manifest.")
-    s = s[:i] + filt + "        " + s[i:]
+    if i >= 0:
+        s = s[:i] + filt + "        " + s[i:]
+    else:
+        # self-closing <activity .../>: open it up
+        m_act = re.search(r"<activity\b([^>]*?)/>", s)
+        if m_act:
+            s = s[: m_act.start()] + "<activity" + m_act.group(1) + ">\n" + filt + "        </activity>" + s[m_act.end():]
+        else:
+            print("NOTE: no <activity> found; deep links (vless:// ...) were not registered")
 
 m = re.search(r"(?m)^([ \t]*)<application\b", s)
 if not m:
@@ -101,9 +111,9 @@ for path in files:
             )
         else:
             block = (
-                "\n    packagingOptions {\n"
+                "\n    packaging {\n"
                 "        jniLibs {\n"
-                "            useLegacyPackaging true\n"
+                "            useLegacyPackaging = true\n"
                 "        }\n"
                 "    }\n"
             )
@@ -111,18 +121,103 @@ for path in files:
         if count != 1:
             raise SystemExit(f"ERROR: Could not locate android {{ in {path}.")
 
+    # The Xray core, OpenVPN (ics-openvpn) and WireGuard-over-Xray engines are native
+    # libraries that call back into Java classes by name over JNI. R8 cannot see those
+    # references and strips/renames the classes in release builds, so the core silently
+    # never starts. Keep the code unshrunk.
+    kts = path.endswith(".kts")
+    shrink = (
+        "            isMinifyEnabled = false\n            isShrinkResources = false\n"
+        if kts
+        else "            minifyEnabled false\n            shrinkResources false\n"
+    )
+    if "isMinifyEnabled" not in t and "minifyEnabled" not in t:
+        t, n = re.subn(r"(?m)^(\s*)release\s*\{\s*\n", lambda m: m.group(0) + shrink, t, count=1)
+        if n != 1:
+            print(f"NOTE: no release block found in {path}; build with --no-shrink instead")
+    else:
+        t = re.sub(r"isMinifyEnabled\s*=\s*true", "isMinifyEnabled = false", t)
+        t = re.sub(r"isShrinkResources\s*=\s*true", "isShrinkResources = false", t)
+        t = re.sub(r"minifyEnabled\s+true", "minifyEnabled false", t)
+        t = re.sub(r"shrinkResources\s+true", "shrinkResources false", t)
+
     with open(path, "w", encoding="utf-8") as f:
         f.write(t)
 
+    if "libs/libXray.aar" not in t:
+        dep = '    implementation(files("libs/libXray.aar"))\n' if kts else "    implementation files('libs/libXray.aar')\n"
+        t2, n = re.subn(r"(?m)^(\s*dependencies\s*\{[^\n]*\n)", lambda m: m.group(1) + dep, t, count=1)
+        if n != 1:
+            raise SystemExit(f"ERROR: Could not add LibXray AAR dependency in {path}")
+        t = t2
+
     if PKG not in t:
         raise SystemExit(f"ERROR: {PKG} was not applied in {path}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(t)
 
-# ------------------------------------------------------------ MainActivity
+# ------------------------------------------------- gradle.properties / JitPack
+# Keep native libraries extractable: DNSTT and Slipstream are executable payloads in jniLibs.
+gp = "android/gradle.properties"
+if os.path.exists(gp):
+    with open(gp, encoding="utf-8") as f:
+        g = f.read()
+    if "android.bundle.enableUncompressedNativeLibs" not in g:
+        with open(gp, "a", encoding="utf-8") as f:
+            f.write(("" if g.endswith("\n") else "\n") + "android.bundle.enableUncompressedNativeLibs=false\n")
+
+# openvpn_flutter downloads its engine from JitPack. The plugin adds the repository itself, which
+# fails only when settings.gradle(.kts) uses dependencyResolutionManagement with FAIL_ON_PROJECT_REPOS.
+for sg in glob.glob("android/settings.gradle*"):
+    with open(sg, encoding="utf-8") as f:
+        t = f.read()
+    if "dependencyResolutionManagement" in t and "jitpack.io" not in t:
+        kts = sg.endswith(".kts")
+        line = 'maven { url = uri("https://jitpack.io") }' if kts else "maven { url 'https://jitpack.io' }"
+        t2, n = re.subn(
+            r"(dependencyResolutionManagement\s*\{.*?repositories\s*\{\n)",
+            lambda m: m.group(1) + "        " + line + "\n",
+            t,
+            count=1,
+            flags=re.S,
+        )
+        if n == 1:
+            with open(sg, "w", encoding="utf-8") as f:
+                f.write(t2)
+            print(f"Added the JitPack repository to {sg}")
+
+# ------------------------------------------------------------ native Android bridge + VPN service
 for old in glob.glob("android/app/src/main/**/MainActivity.*", recursive=True):
     os.remove(old)
 dest_dir = os.path.join("android/app/src/main/kotlin", *PKG.split("."))
 os.makedirs(dest_dir, exist_ok=True)
 shutil.copy("tools/native/MainActivity.kt", os.path.join(dest_dir, "MainActivity.kt"))
+shutil.copy("tools/native/XrayVpnService.kt", os.path.join(dest_dir, "XrayVpnService.kt"))
+
+with open(mf, encoding="utf-8") as f:
+    s = f.read()
+if 'android:name=".XrayVpnService"' not in s:
+    service = """
+        <service
+            android:name=".XrayVpnService"
+            android:process=":xray"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User initiated Xray VPN tunnel" />
+        </service>
+"""
+    idx = s.rfind("</application>")
+    if idx < 0:
+        raise SystemExit("ERROR: </application> not found while registering XrayVpnService")
+    s = s[:idx] + service + s[idx:]
+    with open(mf, "w", encoding="utf-8") as f:
+        f.write(s)
 
 # ----------------------------------------------------------- launcher icon
 def png(w, h, rgba):

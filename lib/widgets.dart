@@ -23,6 +23,10 @@ IconData typeIcon(ProfileType t) => switch (t) {
       ProfileType.proxy => Icons.swap_horiz,
       ProfileType.wireguard => Icons.vpn_key_outlined,
       ProfileType.openvpn => Icons.security,
+      ProfileType.dnstt => Icons.dns_outlined,
+      ProfileType.slipstream => Icons.waves_outlined,
+      ProfileType.openconnect => Icons.vpn_lock,
+      ProfileType.psiphon => Icons.public,
       ProfileType.chain => Icons.link,
       ProfileType.group => Icons.layers_outlined,
     };
@@ -33,6 +37,10 @@ String typeShort(ProfileType t) => switch (t) {
       ProfileType.proxy => 'Proxy',
       ProfileType.wireguard => 'WireGuard',
       ProfileType.openvpn => 'OpenVPN',
+      ProfileType.dnstt => 'DNSTT',
+      ProfileType.slipstream => 'Slipstream',
+      ProfileType.openconnect => 'OpenConnect',
+      ProfileType.psiphon => 'Psiphon',
       ProfileType.chain => 'Chain',
       ProfileType.group => 'Group',
     };
@@ -43,6 +51,10 @@ String typeBlurb(ProfileType t) => switch (t) {
       ProfileType.proxy => 'HTTP, HTTPS or SOCKS5 proxy with login and custom headers',
       ProfileType.wireguard => 'Paste a wg-quick configuration',
       ProfileType.openvpn => 'Paste a .ovpn file (UDP or TCP)',
+      ProfileType.dnstt => 'SlowDNS TCP tunnel via UDP DNS, DoH or DoT',
+      ProfileType.slipstream => 'QUIC-over-DNS transport through a local TCP tunnel',
+      ProfileType.openconnect => 'Cisco AnyConnect-compatible SSL VPN; requires the native OpenConnect engine',
+      ProfileType.psiphon => 'Psiphon circumvention tunnel; requires the isolated official Psiphon Android library',
       ProfileType.chain => 'Entry server → exit server',
       ProfileType.group => 'Try several servers in order until one works',
     };

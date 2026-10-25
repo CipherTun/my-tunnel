@@ -103,6 +103,29 @@ class _EditPageState extends State<EditPage> {
               },
             ),
           ),
+        const Divider(),
+        sw('dnstt', 'DNSTT (SlowDNS) tunnel',
+            'SSH carried inside DNS queries. Leave the SSH host empty (the server is reached '
+                'through the tunnel). TLS, proxy, payload and WebSocket below are ignored while this is on.'),
+        if (_d['dnstt'] == true) ...[
+          tf('dnsttDomain', 'Tunnel domain (NS record)', hint: 't.example.com'),
+          tf('dnsttKey', 'Server public key (64 hex characters)',
+              mono: true, lines: 2, hint: 'from "dnstt-server -gen-key"'),
+          dd('dnsttMode', 'DNS transport', const ['udp', 'doh', 'dot'], 'udp'),
+          tf('dnsttResolver', 'DNS resolver',
+              def: '8.8.8.8:53',
+              hint: 'udp / dot: host:port     doh: https://1.1.1.1/dns-query'),
+          const Padding(
+            padding: EdgeInsets.only(bottom: 12),
+            child: Text(
+                'The server side must run dnstt-server forwarding to its SSH port. Plain UDP needs '
+                'a resolver that answers from your network (often your operator DNS). DoH / DoT: '
+                'use an IP-based endpoint such as https://1.1.1.1/dns-query or 1.1.1.1:853, '
+                'because the engine cannot use the phone\'s DNS settings.',
+                style: TextStyle(fontSize: 12)),
+          ),
+        ],
+        const Divider(),
         sw('tls', 'SSL / TLS tunnel (SNI)', 'SSH wrapped in TLS, e.g. stunnel or nginx stream'),
         if (_d['tls'] == true) ...[
           tf('sni', 'SNI', hint: 'cdn.example.com   or   [random=a.com,b.com]  [rotate=...]'),
@@ -271,6 +294,42 @@ class _EditPageState extends State<EditPage> {
     ];
   }
 
+  List<Widget> _dnstt() => [
+        tf('domain', 'DNSTT tunnel domain', hint: 't.example.com'),
+        tf('pubKey', 'DNSTT server public key (64 hex characters)', lines: 2, mono: true),
+        dd('mode', 'DNS transport', const ['udp', 'doh', 'dot'], 'udp'),
+        tf('resolver', 'Resolver (host:port or DoH URL)', def: '8.8.8.8:53', hint: '8.8.8.8:53 or https://1.1.1.1/dns-query'),
+        const Text('The DNSTT server must forward its TCP tunnel to a SOCKS-compatible endpoint for full VPN routing.', style: TextStyle(fontSize: 12)),
+      ];
+
+  List<Widget> _slipstream() => [
+        tf('domain', 'Slipstream tunnel domain', hint: 's.example.com'),
+        dd('mode', 'DNS mode', const ['resolver', 'authoritative'], 'resolver'),
+        tf('resolver', 'Resolver / authoritative endpoint (host:port)', def: '1.1.1.1:53', hint: '1.1.1.1:53'),
+        tf('certPem', 'Optional pinned server certificate (PEM)', lines: 5, mono: true, hint: '-----BEGIN CERTIFICATE-----'),
+        const Text('Slipstream transports TCP to the remote service. Configure the server to forward this tunnel to a SOCKS-compatible endpoint. Supplying the server certificate enables strict leaf pinning.', style: TextStyle(fontSize: 12)),
+      ];
+
+  List<Widget> _openconnect() => [
+        tf('gateway', 'OpenConnect gateway URL', hint: 'https://vpn.example.com'),
+        tf('user', 'Username'),
+        tf('pass', 'Password', obscure: true),
+        tf('group', 'Gateway group / realm (optional)'),
+        tf('token', 'One-time token / OTP (optional)', obscure: true),
+        tf('serverCert', 'Expected server certificate SHA-256 (optional)', mono: true, hint: 'Pin only when supplied by your administrator'),
+        tf('caCertPem', 'Custom CA certificate PEM (optional)', lines: 5, mono: true),
+        sw('noDtls', 'Disable DTLS (TCP only)', 'Use only if UDP/DTLS is blocked by the network'),
+        const Text('Requires the native OpenConnect Android engine. This profile does not silently fall back to Xray or OpenVPN.', style: TextStyle(fontSize: 12)),
+      ];
+
+  List<Widget> _psiphon() => [
+        tf('configJson', 'Psiphon client configuration JSON', lines: 12, mono: true, hint: '{ ... official Psiphon SDK config ... }'),
+        tf('embeddedServerEntries', 'Embedded server entries (optional)', lines: 5, mono: true),
+        tf('region', 'Preferred egress region (optional)', hint: 'e.g. US, CA, GB'),
+        tf('upstreamProxy', 'Upstream proxy (optional)', hint: 'socks5://127.0.0.1:1080'),
+        const Text('Requires the official Psiphon Android library in its own Android process because it embeds a Go runtime. Use configuration and server entries supplied by a legitimate Psiphon deployment; this app does not invent server entries.', style: TextStyle(fontSize: 12)),
+      ];
+
   List<Widget> _openvpn() => [
         tf('config', '.ovpn file content', lines: 14, mono: true),
         tf('user', 'Username (auth-user-pass, optional)'),
@@ -423,6 +482,10 @@ class _EditPageState extends State<EditPage> {
                 tf('config', 'WireGuard config (wg-quick format)', lines: 14, mono: true)
               ],
             ProfileType.openvpn => _openvpn(),
+            ProfileType.dnstt => _dnstt(),
+            ProfileType.slipstream => _slipstream(),
+            ProfileType.openconnect => _openconnect(),
+            ProfileType.psiphon => _psiphon(),
             ProfileType.chain => _chain(),
             ProfileType.group => _group(),
           },

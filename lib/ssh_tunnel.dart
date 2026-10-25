@@ -7,9 +7,11 @@ import 'dart:typed_data';
 import 'package:dartssh2/dartssh2.dart';
 
 import 'bytebuf.dart';
+import 'dnstt.dart';
 import 'payload.dart';
 import 'udpgw.dart';
 
+export 'dnstt.dart';
 export 'payload.dart';
 
 typedef Log = void Function(String message);
@@ -40,6 +42,7 @@ class SshOptions {
     this.hotspotUser = '',
     this.hotspotPass = '',
     this.verifyHostKey,
+    this.dnstt,
   });
 
   final String host;
@@ -73,6 +76,26 @@ class SshOptions {
 
   /// Host-key check (trust-on-first-use pinning is implemented by the caller).
   final SSHHostkeyVerifyHandler? verifyHostKey;
+
+  /// When set, SSH is carried inside a DNSTT (SlowDNS) tunnel and the
+  /// proxy / TLS / payload / WebSocket options are not used.
+  final DnsttConfig? dnstt;
+
+  /// The same login, pointed at the local port of a running DNSTT engine.
+  SshOptions viaLocalPort(int localPort) => SshOptions(
+        host: '127.0.0.1',
+        port: localPort,
+        user: user,
+        pass: pass,
+        keyPem: keyPem,
+        keyPass: keyPass,
+        keepAlive: keepAlive,
+        udpgwPort: udpgwPort,
+        shareHotspot: shareHotspot,
+        hotspotUser: hotspotUser,
+        hotspotPass: hotspotPass,
+        verifyHostKey: verifyHostKey,
+      );
 }
 
 /// Transport that can send a payload, strip the HTTP reply, optionally speak
@@ -80,8 +103,7 @@ class SshOptions {
 class TunnelSocket implements SSHSocket {
   TunnelSocket(this._socket, {required bool expectHeader, bool ws = false})
       : _pass = !expectHeader,
-        _ws = ws,
-        _webSocketActive = false {
+        _ws = ws {
     _framed = _FramedSink(_socket);
     _socket.listen(
       _onData,
@@ -100,7 +122,6 @@ class TunnelSocket implements SSHSocket {
 
   final Socket _socket;
   final bool _ws;
-  bool _webSocketActive;
   late final _FramedSink _framed;
   final StreamController<Uint8List> _in = StreamController<Uint8List>();
   final ByteBuf _buf = ByteBuf();
@@ -113,10 +134,9 @@ class TunnelSocket implements SSHSocket {
   int _socksState = -1;
   String _sHost = '', _sUser = '', _sPass = '';
   int _sPort = 0;
-  bool _socksExpectPayloadHeader = false;
 
   void _deliver(Uint8List d) {
-    if (!_webSocketActive) {
+    if (!_ws) {
       _in.add(d);
       return;
     }
@@ -150,22 +170,6 @@ class TunnelSocket implements SSHSocket {
       return;
     }
     final header = latin1.decode(_buf.take(end + 4), allowInvalid: true);
-
-    // A confirmed WebSocket upgrade means subsequent SSH bytes are framed.
-    // Keep the target branch's existing raw-socket frame sink and parser.
-    final statusLine = header.split('\r\n').first;
-    final statusParts = statusLine.trim().split(RegExp(r'\s+'));
-    final statusCode =
-        statusParts.length > 1 ? int.tryParse(statusParts[1]) : null;
-    if (statusCode == 101 &&
-        RegExp(
-      r'^upgrade:\s*websocket\s*$',
-      caseSensitive: false,
-      multiLine: true,
-    ).hasMatch(header)) {
-      _webSocketActive = true;
-    }
-
     _pass = true;
     if (_buf.length > 0) _deliver(_buf.take(_buf.length));
     h.complete(header);
@@ -256,16 +260,9 @@ class TunnelSocket implements SSHSocket {
   }
 
   /// RFC 1928 CONNECT through an upstream SOCKS5 proxy (RFC 1929 login optional).
-  Future<void> socks5Connect(
-    String host,
-    int port, {
-    String user = '',
-    String pass = '',
-    bool expectPayloadHeader = false,
-  }) async {
+  Future<void> socks5Connect(String host, int port, {String user = '', String pass = ''}) async {
     _socksDone = Completer<void>();
-    _pass = false;
-    _socksExpectPayloadHeader = expectPayloadHeader;
+    _pass = false; // buffer the proxy replies for the handshake, do not hand them to SSH
     _socksState = 0;
     _sHost = host;
     _sPort = port;
@@ -293,10 +290,8 @@ class TunnelSocket implements SSHSocket {
       if (_socksState == 0) {
         if (_buf.length < 2) return;
         final m = _buf.take(2);
-        if (m[0] != 5 ||
-            !const [0, 2].contains(m[1]) ||
-            (m[1] == 2 && _sUser.isEmpty)) {
-          _socksFail('SOCKS5 proxy selected an unsupported authentication method');
+        if (m[0] != 5 || m[1] == 0xff) {
+          _socksFail('SOCKS5 proxy refused the login method');
           return;
         }
         if (m[1] == 2) {
@@ -311,7 +306,7 @@ class TunnelSocket implements SSHSocket {
       if (_socksState == 1) {
         if (_buf.length < 2) return;
         final r = _buf.take(2);
-        if (r[0] != 1 || r[1] != 0) {
+        if (r[1] != 0) {
           _socksFail('SOCKS5 proxy rejected the username/password');
           return;
         }
@@ -320,25 +315,17 @@ class TunnelSocket implements SSHSocket {
       }
       if (_socksState == 2) {
         if (_buf.length < 5) return;
-        if (_buf[0] != 5 || _buf[2] != 0) {
-          _socksFail('SOCKS5 proxy returned a malformed CONNECT response');
-          return;
-        }
         final atyp = _buf[3];
-        if (atyp != 1 && atyp != 3 && atyp != 4) {
-          _socksFail('SOCKS5 proxy returned an unsupported address type');
-          return;
-        }
         final total = atyp == 1 ? 10 : (atyp == 4 ? 22 : 7 + _buf[4]);
         if (_buf.length < total) return;
         final rep = _buf.take(total);
-        if (rep[0] != 5 || rep[2] != 0 || rep[1] != 0) {
+        if (rep[1] != 0) {
           _socksFail('SOCKS5 proxy could not reach the server (reply code ${rep[1]})');
           return;
         }
-        _pass = !_socksExpectPayloadHeader;
+        _pass = true;
         _socksState = -1;
-        if (_pass && _buf.length > 0) _deliver(_buf.take(_buf.length));
+        if (_buf.length > 0) _deliver(_buf.take(_buf.length));
         c.complete();
       }
     } catch (e) {
@@ -362,8 +349,7 @@ class TunnelSocket implements SSHSocket {
   @override
   Stream<Uint8List> get stream => _in.stream;
   @override
-  StreamSink<List<int>> get sink =>
-      _webSocketActive ? _framed : _socket;
+  StreamSink<List<int>> get sink => _ws ? _framed : _socket;
   @override
   Future<void> get done => _socket.done;
   Future<void> flush() => _socket.flush();
@@ -412,11 +398,6 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
       await Socket.connect(firstHost, firstPort, timeout: const Duration(seconds: 15));
   sock.setOption(SocketOption.tcpNoDelay, true);
 
-  if (useProxy && o.proxyType == 'socks5' && o.useTls) {
-    sock.destroy();
-    throw 'TLS with an upstream SOCKS5 proxy is not supported by this transport. Disable TLS or use HTTP CONNECT.';
-  }
-
   if (o.useTls) {
     final sni = expandRandomRotate(o.sni.isNotEmpty ? o.sni : o.host);
     log('TLS handshake (SNI: $sni${o.allowInsecure ? '' : ', verified'})');
@@ -424,40 +405,24 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
         host: sni, onBadCertificate: o.allowInsecure ? (_) => true : null);
   }
 
-  var template = o.payload.trim();
-  if (template.isEmpty && useProxy && o.proxyType != 'socks5') {
-    final auth = o.proxyUser.isEmpty
-        ? ''
-        : 'Proxy-Authorization: Basic ${base64.encode(utf8.encode('${o.proxyUser}:${o.proxyPass}'))}[crlf]';
-    template = 'CONNECT [host_port] [protocol][crlf]Host: [host][crlf]$auth[crlf]';
-  }
-
   if (useProxy && o.proxyType == 'socks5') {
-    final ts = TunnelSocket(sock, expectHeader: template.isNotEmpty, ws: o.wsFraming);
+    final ts = TunnelSocket(sock, expectHeader: false, ws: o.wsFraming);
     log('SOCKS5 CONNECT ${o.host}:${o.port}');
     try {
-      await ts.socks5Connect(
-        o.host, o.port,
-        user: o.proxyUser,
-        pass: o.proxyPass,
-        expectPayloadHeader: template.isNotEmpty,
-      );
-      if (template.isNotEmpty) {
-        final chunks = buildPayloadParts(template, host: o.host, port: o.port);
-        log('Sending payload through SOCKS5 (${chunks.length} packet(s))');
-        final line = await ts.sendPayload(chunks);
-        log('Reply: $line');
-        final ok = line.contains(' 101') || line.contains(' 200') || line.startsWith('(');
-        if (!ok || (o.wsFraming && !line.contains(' 101'))) {
-          ts.destroy();
-          throw 'SOCKS5 payload/WebSocket upgrade rejected: $line';
-        }
-      }
-      return ts;
+      await ts.socks5Connect(o.host, o.port, user: o.proxyUser, pass: o.proxyPass);
     } catch (e) {
       ts.destroy();
       rethrow;
     }
+    return ts;
+  }
+
+  var template = o.payload.trim();
+  if (template.isEmpty && useProxy) {
+    final auth = o.proxyUser.isEmpty
+        ? ''
+        : 'Proxy-Authorization: Basic ${base64.encode(utf8.encode('${o.proxyUser}:${o.proxyPass}'))}[crlf]';
+    template = 'CONNECT [host_port] [protocol][crlf]Host: [host][crlf]$auth[crlf]';
   }
 
   final ts = TunnelSocket(sock, expectHeader: template.isNotEmpty, ws: o.wsFraming);
@@ -467,7 +432,7 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
     final line = await ts.sendPayload(chunks);
     log('Reply: $line');
     final ok = line.contains(' 101') || line.contains(' 200') || line.startsWith('(');
-    if (!ok || (o.wsFraming && !line.contains(' 101'))) {
+    if (!ok) {
       ts.destroy();
       throw 'Proxy/server rejected payload: $line';
     }
@@ -480,14 +445,23 @@ Future<TunnelSocket> openTransport(SshOptions o, Log log) async {
 Future<String> testTransport(SshOptions o) async {
   final sw = Stopwatch()..start();
   final log = <String>[];
+  DnsttRunner? runner;
   try {
-    final ts = await openTransport(o, log.add);
+    var opts = o;
+    final d = o.dnstt;
+    if (d != null) {
+      runner = DnsttRunner(d, log.add);
+      opts = o.viaLocalPort(await runner.start());
+    }
+    final ts = await openTransport(opts, log.add);
     String banner;
+    // Through DNS the first bytes need several round trips.
+    final wait = Duration(seconds: d != null ? 25 : 6);
     try {
-      final first = await ts.stream.first.timeout(const Duration(seconds: 6));
+      final first = await ts.stream.first.timeout(wait);
       banner = latin1.decode(first, allowInvalid: true).split('\n').first.trim();
     } catch (_) {
-      banner = '(no data from the server within 6 s)';
+      banner = '(no data from the server within ${wait.inSeconds} s)';
     }
     ts.destroy();
     final ok = banner.startsWith('SSH-');
@@ -496,6 +470,8 @@ Future<String> testTransport(SshOptions o) async {
         ' (${sw.elapsedMilliseconds} ms)';
   } catch (e) {
     return '${log.join('\n')}\nFailed: $e';
+  } finally {
+    await runner?.stop();
   }
 }
 
@@ -958,7 +934,33 @@ class SshTunnel {
   int get txBytes => _socks?.txBytes ?? 0;
   int get rxBytes => _socks?.rxBytes ?? 0;
 
+  DnsttRunner? _dnstt;
+
   Future<int> start(SshOptions o, Log log, {int socksPort = 10808}) async {
+    var opts = o;
+    final d = o.dnstt;
+    if (d != null) {
+      final runner = DnsttRunner(d, log);
+      runner.onExit = () {
+        if (!_alive) return;
+        _alive = false;
+        log('DNSTT engine stopped; the SSH session is lost');
+        onClosed?.call();
+      };
+      opts = o.viaLocalPort(await runner.start());
+      _dnstt = runner;
+    }
+    try {
+      return await _connect(opts, log, socksPort);
+    } catch (_) {
+      final r = _dnstt;
+      _dnstt = null;
+      await r?.stop();
+      rethrow;
+    }
+  }
+
+  Future<int> _connect(SshOptions o, Log log, int socksPort) async {
     final sock = await openTransport(o, log);
     log('SSH handshake + auth as ${o.user}');
     List<SSHKeyPair>? ids;
@@ -1070,5 +1072,8 @@ class SshTunnel {
     _socks = null;
     _client?.close();
     _client = null;
+    final r = _dnstt;
+    _dnstt = null;
+    await r?.stop();
   }
 }

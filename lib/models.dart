@@ -6,7 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'config_tweaks.dart';
 import 'subscription.dart';
 
-enum ProfileType { ssh, v2ray, proxy, wireguard, openvpn, chain, group }
+enum ProfileType { ssh, v2ray, proxy, wireguard, openvpn, dnstt, slipstream, openconnect, psiphon, chain, group }
 
 String typeLabel(ProfileType t) => switch (t) {
       ProfileType.ssh => 'SSH Tunnel',
@@ -14,6 +14,10 @@ String typeLabel(ProfileType t) => switch (t) {
       ProfileType.proxy => 'HTTP / HTTPS / SOCKS5 Proxy',
       ProfileType.wireguard => 'WireGuard',
       ProfileType.openvpn => 'OpenVPN',
+      ProfileType.dnstt => 'DNSTT / SlowDNS',
+      ProfileType.slipstream => 'Slipstream DNS Tunnel',
+      ProfileType.openconnect => 'OpenConnect / AnyConnect',
+      ProfileType.psiphon => 'Psiphon',
       ProfileType.chain => 'Proxy Chain (entry → exit)',
       ProfileType.group => 'Failover Group',
     };
@@ -43,19 +47,27 @@ class Profile {
   String get connectAddr => s('connectAddr').trim();
 
   /// Host:port that identifies the SSH server (key pinning, latency tests).
-  String get hostKey => '${s('host').trim()}:${s('port').isEmpty ? '22' : s('port')}';
+  String get hostKey {
+    var h = s('host').trim();
+    if (h.isEmpty && b('dnstt')) h = s('dnsttDomain').trim();
+    return '$h:${s('port').isEmpty ? '22' : s('port')}';
+  }
 
   String get subtitle {
     switch (type) {
       case ProfileType.ssh:
         final extra = <String>[
+          if (b('dnstt')) 'DNSTT',
           if (b('tls')) 'TLS/SNI',
           if (s('proxyHost').isNotEmpty) (s('proxyType') == 'socks5' ? 'SOCKS5 proxy' : 'HTTP proxy'),
           if (s('payload').isNotEmpty) 'payload',
           if (b('ws')) 'WS',
           if ((int.tryParse(s('udpgwPort')) ?? 0) > 0) 'UDP',
         ].join(' + ');
-        return 'SSH ${s('host')}:${s('port')}${extra.isEmpty ? '' : '  ·  $extra'}';
+        final where = s('host').trim().isEmpty && b('dnstt')
+            ? s('dnsttDomain').trim()
+            : '${s('host')}:${s('port')}';
+        return 'SSH $where${extra.isEmpty ? '' : '  ·  $extra'}';
       case ProfileType.v2ray:
         switch (s('mode')) {
           case 'json':
@@ -73,6 +85,14 @@ class Profile {
       case ProfileType.openvpn:
         final r = parseOvpnRemote(s('config'));
         return r == null ? 'OpenVPN' : 'OpenVPN ${r.host}:${r.port} ${r.proto.toUpperCase()}';
+      case ProfileType.dnstt:
+        return 'DNSTT ${s('domain')} · ${s('mode').isEmpty ? 'UDP' : s('mode').toUpperCase()}';
+      case ProfileType.slipstream:
+        return 'Slipstream ${s('domain')} · ${s('mode').isEmpty ? 'RESOLVER' : s('mode').toUpperCase()}';
+      case ProfileType.openconnect:
+        return 'OpenConnect ${s('gateway').isEmpty ? 'gateway not set' : s('gateway')}';
+      case ProfileType.psiphon:
+        return 'Psiphon ${s('region').isEmpty ? 'automatic region' : s('region')}';
       case ProfileType.chain:
         return 'Chain of 2 servers';
       case ProfileType.group:
@@ -163,6 +183,38 @@ Profile? importProfile(String raw, {String? id}) {
   if (proxy != null) return proxy;
   final scheme = t.split('://').first.toLowerCase();
   if (!t.contains('://') || !shareSchemes.contains(scheme)) return null;
+  if (scheme == 'dnstt') {
+    final u = Uri.tryParse(t);
+    if (u == null) return null;
+    final domain = u.host.isNotEmpty ? u.host : u.path.replaceFirst(RegExp(r'^/'), '');
+    return Profile(
+      id: id,
+      name: u.fragment.isNotEmpty ? _safeDecode(u.fragment) : domain,
+      type: ProfileType.dnstt,
+      data: {
+        'domain': domain,
+        'pubKey': u.queryParameters['pubkey'] ?? u.queryParameters['key'] ?? '',
+        'mode': u.queryParameters['mode'] ?? 'udp',
+        'resolver': u.queryParameters['resolver'] ?? '8.8.8.8:53',
+      },
+    );
+  }
+  if (scheme == 'slipstream') {
+    final u = Uri.tryParse(t);
+    if (u == null) return null;
+    final domain = u.host.isNotEmpty ? u.host : u.path.replaceFirst(RegExp(r'^/'), '');
+    return Profile(
+      id: id,
+      name: u.fragment.isNotEmpty ? _safeDecode(u.fragment) : domain,
+      type: ProfileType.slipstream,
+      data: {
+        'domain': domain,
+        'resolver': u.queryParameters['resolver'] ?? '1.1.1.1:53',
+        'mode': u.queryParameters['mode'] ?? 'resolver',
+        'certPem': u.queryParameters['cert'] ?? '',
+      },
+    );
+  }
   if (scheme == 'ssh') {
     final u = Uri.tryParse(t);
     if (u == null || u.host.isEmpty) return null;

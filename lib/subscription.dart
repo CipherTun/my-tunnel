@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-const shareSchemes = ['vmess', 'vless', 'trojan', 'ss', 'socks', 'hysteria2', 'hy2', 'hysteria', 'ssh'];
+const shareSchemes = ['vmess', 'vless', 'trojan', 'ss', 'socks', 'hysteria2', 'hy2', 'hysteria', 'ssh', 'dnstt', 'slipstream'];
 
 class Subscription {
   Subscription({required this.id, required this.name, required this.url, this.updated = 0});

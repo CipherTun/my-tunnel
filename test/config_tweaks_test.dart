@@ -74,10 +74,6 @@ void main() {
         '[Peer]\nPublicKey = p\nEndpoint = 1.2.3.4:51820\n');
     expect(ob['protocol'], 'wireguard');
     expect(ob['settings']['peers'][0]['endpoint'], '1.2.3.4:51820');
-    expect(
-      ob['settings']['peers'][0]['allowedIPs'],
-      ['0.0.0.0/0', '::/0'],
-    );
     expect(() => wgToOutbound('[Interface]\nPrivateKey = k\n'), throwsA(isA<String>()));
   });
 

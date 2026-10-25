@@ -1,12 +1,16 @@
-name: Build APK
+name: Build XRay Vpn
 
 on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   android:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -18,17 +22,113 @@ jobs:
           channel: stable
           cache: true
       - run: flutter --version
-      # Generate android/ (kept out of git) with the correct package: xyz.xray.vpn
+
+      # Generate the Android shell with the stable package id. The official
+      # LibXray AAR is pinned and checksum-verified instead of using the legacy
+      # flutter_v2ray_client plugin.
       - run: flutter create --platforms=android --org xyz.xray --project-name vpn .
+      - name: Download and verify official LibXray Android AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android/app/libs
+          archive="$RUNNER_TEMP/libxray-android.zip"
+          curl --fail --location --retry 3 \
+            https://github.com/XTLS/libXray/releases/download/v26.10.21/libxray-android.zip \
+            --output "$archive"
+          echo "ddefb68bb784ec291f977f85200c1a89b0c0a3847412d14b0d0b84b864b0c7e7  $archive" | sha256sum --check
+          archive_entries="$(unzip -Z1 "$archive")"
+          aar_entry="$(printf '%s\n' "$archive_entries" | grep -E '(^|/)libXray\.aar$' | sed -n '1p')"
+          test -n "$aar_entry" || { echo "ERROR: libXray.aar missing from official release archive"; exit 1; }
+          unzip -p "$archive" "$aar_entry" > android/app/libs/libXray.aar
+          test -s android/app/libs/libXray.aar
+          aar_entries="$(unzip -Z1 android/app/libs/libXray.aar)"
+          printf '%s\n' "$aar_entries" | grep -E '^jni/[^/]+/.*\.so$'
       - run: python3 tools/patch_android.py
+
+      # DNSTT is a standalone child process, not another Go AAR in the app
+      # process. This avoids loading two independent Go runtimes together.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: bash tools/build_dnstt.sh
+
+      # Slipstream is a native executable too. Build it for every Android ABI
+      # and run it as a child process, separate from the LibXray Go runtime.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.2.12479018"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi,aarch64-linux-android,i686-linux-android,x86_64-linux-android
+      - run: bash tools/build_slipstream.sh
+
+      # Dart has no inline regex flags: (?i)(?m) throw "Invalid group" at runtime.
+      - run: python3 tools/fix_regex_flags.py
       - run: flutter pub get
-      # Only real errors fail the build; style hints are informational.
       - run: flutter analyze --no-fatal-infos --no-fatal-warnings
       - run: flutter test
-      # One universal APK: armeabi-v7a, arm64-v8a, x86_64
-      - run: flutter build apk --release --target-platform android-arm,android-arm64,android-x64
-      - run: cp build/app/outputs/flutter-apk/app-release.apk xray-vpn.apk
+
+      - name: Build split release APKs (one APK per ABI)
+        run: flutter build apk --release --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x86,android-x64
+      - name: Verify each release APK and native engine payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=build/app/outputs/flutter-apk
+          declare -A expected=(
+            [app-armeabi-v7a-release.apk]=armeabi-v7a
+            [app-arm64-v8a-release.apk]=arm64-v8a
+            [app-x86-release.apk]=x86
+            [app-x86_64-release.apk]=x86_64
+          )
+          for apk in "${!expected[@]}"; do
+            test -s "$out/$apk" || { echo "ERROR: missing $apk"; exit 1; }
+            abi="${expected[$apk]}"
+            entries="$(unzip -Z1 "$out/$apk")"
+            for lib in libdnstt.so libslipstream.so; do
+              printf '%s\n' "$entries" | grep -q "^lib/$abi/$lib$" || { echo "ERROR: $lib missing for $abi in $apk"; exit 1; }
+            done
+            cp "$out/$apk" "xray-vpn-$abi.apk"
+            echo "Verified $apk ($abi)"
+          done
+          aar_entries="$(unzip -Z1 android/app/libs/libXray.aar)"
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+            printf '%s\n' "$aar_entries" | grep -q "^jni/$abi/" || { echo "ERROR: LibXray AAR missing native ABI $abi"; exit 1; }
+          done
+          echo "Verified LibXray AAR and all four native engine ABI payloads."
       - uses: actions/upload-artifact@v4
         with:
-          name: xray-vpn-universal-apk
-          path: xray-vpn.apk
+          name: xray-vpn-armeabi-v7a-apk
+          path: xray-vpn-armeabi-v7a.apk
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-arm64-v8a-apk
+          path: xray-vpn-arm64-v8a.apk
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-x86-apk
+          path: xray-vpn-x86.apk
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-x86_64-apk
+          path: xray-vpn-x86_64.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build debug split APKs
+        run: flutter build apk --debug --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x86,android-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-debug-split-apks
+          path: build/app/outputs/flutter-apk/app-*-debug.apk
+          if-no-files-found: error
+          retention-days: 14

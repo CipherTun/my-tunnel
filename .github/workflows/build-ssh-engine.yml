@@ -302,12 +302,16 @@ jobs:
           set -euo pipefail
           mkdir -p dist/ssh
 
-          gomobile bind \
-            -v \
-            -target=android/arm,android/arm64 \
-            -androidapi 23 \
-            -o "$GITHUB_WORKSPACE/dist/ssh/xray-ssh-engine.aar" \
-            ./ssh-engine
+          # Run from the module that declares the gobind tool dependency.
+          (
+            cd ssh-engine
+            gomobile bind \
+              -v \
+              -target=android/arm,android/arm64 \
+              -androidapi 23 \
+              -o "$GITHUB_WORKSPACE/dist/ssh/xray-ssh-engine.aar" \
+              .
+          )
 
           test -s dist/ssh/xray-ssh-engine.aar
           sha256sum dist/ssh/xray-ssh-engine.aar > dist/ssh/SHA256SUMS.txt

@@ -49,6 +49,36 @@ jobs:
           path: slipstream-rust
           submodules: recursive
 
+      - name: Expose vendored OpenSSL to Picoquic CMake
+        working-directory: slipstream-rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+
+          path = Path("crates/slipstream-ffi/Cargo.toml")
+          content = path.read_text()
+          old = '[build-dependencies]\ncc = "1.0"\n'
+          new = (
+              '[build-dependencies]\n'
+              'cc = "1.0"\n'
+              'openssl-sys = { version = "0.9", features = ["vendored"] }\n'
+          )
+
+          if content.count(old) != 1:
+              raise SystemExit(
+                  "STOP: Upstream Cargo.toml build-dependencies block "
+                  "did not match exactly once."
+              )
+
+          path.write_text(content.replace(old, new, 1))
+          print("Added vendored openssl-sys build dependency.")
+          PY_PATCH
+
+          grep -n -A4 '^\[build-dependencies\]' crates/slipstream-ffi/Cargo.toml
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
       - name: Configure Android linker
         shell: bash
         run: |

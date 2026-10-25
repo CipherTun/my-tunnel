@@ -35,6 +35,16 @@ jobs:
           test -s MobileLibrary/Android/make.bash
           find MobileLibrary/Android -maxdepth 2 -type f -print
 
+      - name: Prepare upstream gomobile source for Docker
+        working-directory: psiphon-tunnel-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d MobileLibrary/go-mobile/cmd/gomobile
+          test ! -e go-mobile
+          ln -s MobileLibrary/go-mobile go-mobile
+          test -f go-mobile/cmd/gomobile/main.go || test -f go-mobile/cmd/gomobile/gomobile.go || test -d go-mobile/cmd/gomobile
+
       - name: Build official Android build image
         working-directory: psiphon-tunnel-core
         run: |

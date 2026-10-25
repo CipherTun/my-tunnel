@@ -282,6 +282,7 @@ jobs:
           }
           GO
 
+          go get golang.org/x/mobile@latest
           go mod tidy
           go test ./...
           go vet ./...

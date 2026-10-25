@@ -57,6 +57,16 @@ jobs:
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           test -x "$TOOLCHAIN/${{ matrix.linker }}"
           echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')_LINKER=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+          case "${{ matrix.target }}" in
+            armv7-linux-androideabi)
+              echo "CC_armv7_linux_androideabi=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+              echo "AR_armv7_linux_androideabi=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+              ;;
+            aarch64-linux-android)
+              echo "CC_aarch64_linux_android=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+              echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+              ;;
+          esac
 
       - name: Verify upstream package
         working-directory: slipstream-rust
@@ -72,6 +82,7 @@ jobs:
           set -euo pipefail
           cargo build --locked --release \
             --package slipstream-client \
+            --features openssl-vendored \
             --target "${{ matrix.target }}"
 
       - name: Verify and stage binary

@@ -85,9 +85,11 @@ jobs:
           case "${{ matrix.target }}" in
             armv7-linux-androideabi)
               echo "CC_armv7_linux_androideabi=$BIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+              echo "AR_armv7_linux_androideabi=$BIN/llvm-ar" >> "$GITHUB_ENV"
               ;;
             aarch64-linux-android)
               echo "CC_aarch64_linux_android=$BIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+              echo "AR_aarch64_linux_android=$BIN/llvm-ar" >> "$GITHUB_ENV"
               ;;
           esac
 

@@ -24,6 +24,7 @@ jobs:
           repository: Psiphon-Labs/psiphon-tunnel-core
           ref: master
           path: psiphon-tunnel-core
+          submodules: recursive
 
       - name: Inspect upstream Android build
         working-directory: psiphon-tunnel-core

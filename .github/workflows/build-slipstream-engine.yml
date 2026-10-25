@@ -181,6 +181,12 @@ jobs:
           echo "ANDROID_PLATFORM=android-24" >> "$GITHUB_ENV"
 
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          # slipstream-ffi/build/cc.rs explicitly reads these variables
+          # for Android C objects; Cargo's target-specific CC_* is not enough.
+          echo "RUST_ANDROID_GRADLE_CC=$TOOLCHAIN/${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "RUST_ANDROID_GRADLE_AR=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+
           test -x "$TOOLCHAIN/${{ matrix.linker }}"
           test -x "$TOOLCHAIN/llvm-ar"
           test -x "$TOOLCHAIN/llvm-ranlib"

@@ -114,40 +114,42 @@ jobs:
 
           '''
 
-          old = '''    if let Some(root) = &openssl_paths.root {
-              command.env("OPENSSL_ROOT_DIR", root);
-          }
-          '''
+          old = (
+              '    if let Some(root) = &openssl_paths.root {\n'
+              '        command.env("OPENSSL_ROOT_DIR", root);\n'
+              '    }\n'
+          )
 
-          new = '''    if let Some(root) = &openssl_paths.root {
-              command.env("OPENSSL_ROOT_DIR", root);
-
-              for (env_name, file_name) in [
-                  ("OPENSSL_CRYPTO_LIBRARY", "libcrypto.a"),
-                  ("OPENSSL_SSL_LIBRARY", "libssl.a"),
-              ] {
-                  if env::var_os(env_name).is_none() {
-                      match find_library_file(root, file_name, 0) {
-                          Some(library) => {
-                              println!(
-                                  "cargo:warning=Using {}={}",
-                                  env_name,
-                                  library.display()
-                              );
-                              command.env(env_name, library);
-                          }
-                          None => {
-                              println!(
-                                  "cargo:warning=Could not find {} under {}",
-                                  file_name,
-                                  root.display()
-                              );
-                          }
-                      }
-                  }
-              }
-          }
-          '''
+          new = (
+              '    if let Some(root) = &openssl_paths.root {\n'
+              '        command.env("OPENSSL_ROOT_DIR", root);\n'
+              '\n'
+              '        for (env_name, file_name) in [\n'
+              '            ("OPENSSL_CRYPTO_LIBRARY", "libcrypto.a"),\n'
+              '            ("OPENSSL_SSL_LIBRARY", "libssl.a"),\n'
+              '        ] {\n'
+              '            if env::var_os(env_name).is_none() {\n'
+              '                match find_library_file(root, file_name, 0) {\n'
+              '                    Some(library) => {\n'
+              '                        println!(\n'
+              '                            "cargo:warning=Using {}={}",\n'
+              '                            env_name,\n'
+              '                            library.display()\n'
+              '                        );\n'
+              '                        command.env(env_name, library);\n'
+              '                    }\n'
+              '                    None => {\n'
+              '                        println!(\n'
+              '                            "cargo:warning=Could not find {} under {}",\n'
+              '                            file_name,\n'
+              '                            root.display()\n'
+              '                        );\n'
+              '                    }\n'
+              '                }\n'
+              '            }\n'
+              '        }\n'
+              '    }\n'
+          )
 
           if source.count(function_anchor) != 1:
               raise SystemExit("STOP: build_picoquic function anchor did not match exactly once.")

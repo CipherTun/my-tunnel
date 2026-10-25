@@ -1,0 +1,325 @@
+name: Build Standalone SSH Tunnel Engine
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-ssh-engine.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: SSH engine Android ARM32 and ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "NDK=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Create standalone SSH engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ssh-engine
+          cd ssh-engine
+
+          cat > go.mod <<'MOD'
+          module example.com/xrayvpn/sshengine
+
+          go 1.24.0
+
+          require golang.org/x/crypto v0.40.0
+          MOD
+
+          cat > sshengine.go <<'GO'
+          package sshengine
+
+          import (
+              "encoding/binary"
+              "errors"
+              "fmt"
+              "io"
+              "net"
+              "strconv"
+              "strings"
+              "sync"
+
+              "golang.org/x/crypto/ssh"
+          )
+
+          type Tunnel struct {
+              client   *ssh.Client
+              listener net.Listener
+              mu       sync.Mutex
+          }
+
+          // ConnectPassword requires a verified SHA256 SSH host-key fingerprint.
+          func ConnectPassword(host string, port int, username, password, expectedFingerprint string) (*Tunnel, error) {
+              if strings.TrimSpace(host) == "" || port < 1 || port > 65535 ||
+                  username == "" || expectedFingerprint == "" {
+                  return nil, errors.New("host, valid port, username and pinned SHA256 host-key fingerprint are required")
+              }
+
+              expectedFingerprint = strings.TrimSpace(expectedFingerprint)
+              if !strings.HasPrefix(expectedFingerprint, "SHA256:") {
+                  return nil, errors.New("host-key fingerprint must use SHA256 format")
+              }
+
+              address := net.JoinHostPort(host, strconv.Itoa(port))
+              config := &ssh.ClientConfig{
+                  User: username,
+                  Auth: []ssh.AuthMethod{ssh.Password(password)},
+                  HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
+                      actual := ssh.FingerprintSHA256(key)
+                      if actual != expectedFingerprint {
+                          return fmt.Errorf("SSH host-key fingerprint mismatch: got %s", actual)
+                      }
+                      return nil
+                  },
+              }
+
+              raw, err := net.DialTimeout("tcp", address, 15*1e9)
+              if err != nil {
+                  return nil, err
+              }
+
+              connection, channels, requests, err := ssh.NewClientConn(raw, address, config)
+              if err != nil {
+                  raw.Close()
+                  return nil, err
+              }
+
+              return &Tunnel{client: ssh.NewClient(connection, channels, requests)}, nil
+          }
+
+          // StartSocks5 starts a local SOCKS5 CONNECT proxy forwarded through SSH.
+          // Use a loopback address such as 127.0.0.1:1080.
+          func (t *Tunnel) StartSocks5(address string) error {
+              t.mu.Lock()
+              defer t.mu.Unlock()
+
+              if t.client == nil {
+                  return errors.New("SSH tunnel is closed")
+              }
+              if t.listener != nil {
+                  return errors.New("SOCKS5 proxy is already running")
+              }
+
+              listener, err := net.Listen("tcp", address)
+              if err != nil {
+                  return err
+              }
+              t.listener = listener
+
+              go func() {
+                  for {
+                      connection, err := listener.Accept()
+                      if err != nil {
+                          return
+                      }
+                      go t.handleSocks5(connection)
+                  }
+              }()
+              return nil
+          }
+
+          func (t *Tunnel) Socks5Address() string {
+              t.mu.Lock()
+              defer t.mu.Unlock()
+              if t.listener == nil {
+                  return ""
+              }
+              return t.listener.Addr().String()
+          }
+
+          func (t *Tunnel) handleSocks5(local net.Conn) {
+              defer local.Close()
+
+              greeting := make([]byte, 2)
+              if _, err := io.ReadFull(local, greeting); err != nil || greeting[0] != 5 {
+                  return
+              }
+
+              methods := make([]byte, int(greeting[1]))
+              if _, err := io.ReadFull(local, methods); err != nil {
+                  return
+              }
+
+              noAuth := false
+              for _, method := range methods {
+                  if method == 0 {
+                      noAuth = true
+                      break
+                  }
+              }
+              if !noAuth {
+                  _, _ = local.Write([]byte{5, 255})
+                  return
+              }
+              if _, err := local.Write([]byte{5, 0}); err != nil {
+                  return
+              }
+
+              header := make([]byte, 4)
+              if _, err := io.ReadFull(local, header); err != nil || header[0] != 5 {
+                  return
+              }
+              if header[1] != 1 {
+                  _, _ = local.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
+                  return
+              }
+
+              var host string
+              switch header[3] {
+              case 1:
+                  address := make([]byte, 4)
+                  if _, err := io.ReadFull(local, address); err != nil {
+                      return
+                  }
+                  host = net.IP(address).String()
+              case 4:
+                  address := make([]byte, 16)
+                  if _, err := io.ReadFull(local, address); err != nil {
+                      return
+                  }
+                  host = net.IP(address).String()
+              case 3:
+                  size := []byte{0}
+                  if _, err := io.ReadFull(local, size); err != nil {
+                      return
+                  }
+                  name := make([]byte, int(size[0]))
+                  if _, err := io.ReadFull(local, name); err != nil {
+                      return
+                  }
+                  host = string(name)
+              default:
+                  _, _ = local.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
+                  return
+              }
+
+              portBytes := make([]byte, 2)
+              if _, err := io.ReadFull(local, portBytes); err != nil {
+                  return
+              }
+              port := binary.BigEndian.Uint16(portBytes)
+
+              t.mu.Lock()
+              client := t.client
+              t.mu.Unlock()
+              if client == nil {
+                  _, _ = local.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+                  return
+              }
+
+              remote, err := client.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+              if err != nil {
+                  _, _ = local.Write([]byte{5, 5, 0, 1, 0, 0, 0, 0, 0, 0})
+                  return
+              }
+              defer remote.Close()
+
+              if _, err := local.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+                  return
+              }
+
+              done := make(chan struct{}, 2)
+              go func() {
+                  _, _ = io.Copy(remote, local)
+                  done <- struct{}{}
+              }()
+              go func() {
+                  _, _ = io.Copy(local, remote)
+                  done <- struct{}{}
+              }()
+              <-done
+          }
+
+          func (t *Tunnel) Close() error {
+              t.mu.Lock()
+              listener := t.listener
+              client := t.client
+              t.listener = nil
+              t.client = nil
+              t.mu.Unlock()
+
+              if listener != nil {
+                  _ = listener.Close()
+              }
+              if client != nil {
+                  return client.Close()
+              }
+              return nil
+          }
+          GO
+
+          go mod tidy
+          go test ./...
+          go vet ./...
+
+      - name: Install Go mobile binding tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/gomobile" init
+
+      - name: Build Android SSH engine AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ssh
+
+          gomobile bind \
+            -v \
+            -target=android/arm,android/arm64 \
+            -androidapi 23 \
+            -o "$GITHUB_WORKSPACE/dist/ssh/xray-ssh-engine.aar" \
+            ./ssh-engine
+
+          test -s dist/ssh/xray-ssh-engine.aar
+          sha256sum dist/ssh/xray-ssh-engine.aar > dist/ssh/SHA256SUMS.txt
+
+          {
+            echo "Engine: standalone Go SSH tunnel"
+            echo "ABIs: ARM32 and ARM64"
+            echo "Authentication: SSH password with pinned SHA256 host key"
+            echo "Tunnel: SSH TCP forwarding through local SOCKS5 CONNECT proxy"
+            echo "Go version: $(go version)"
+          } > dist/ssh/build-info.txt
+
+      - name: Upload Android SSH engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-ssh-engine-android-arm32-arm64
+          path: dist/ssh/
+          if-no-files-found: error
+          retention-days: 14

@@ -77,6 +77,93 @@ jobs:
           PY_PATCH
 
           grep -n -A4 '^\[build-dependencies\]' crates/slipstream-ffi/Cargo.toml
+
+          # Patch Picoquic's CMake invocation to pass the actual vendored
+          # OpenSSL library paths discovered by the Rust build script.
+          python3 - <<'PY_PICOQUIC'
+          from pathlib import Path
+
+          path = Path("crates/slipstream-ffi/build/picoquic.rs")
+          source = path.read_text()
+
+          function_anchor = "pub(crate) fn build_picoquic("
+          helper = r'''
+          fn find_library_file(root: &Path, file_name: &str, depth: u8) -> Option<PathBuf> {
+              if depth > 8 {
+                  return None;
+              }
+
+              for entry in std::fs::read_dir(root).ok()?.flatten() {
+                  let path = entry.path();
+
+                  if path.is_file()
+                      && path.file_name().and_then(|name| name.to_str()) == Some(file_name)
+                  {
+                      return Some(path);
+                  }
+
+                  if path.is_dir() {
+                      if let Some(found) = find_library_file(&path, file_name, depth + 1) {
+                          return Some(found);
+                      }
+                  }
+              }
+
+              None
+          }
+
+          '''
+
+          old = '''    if let Some(root) = &openssl_paths.root {
+              command.env("OPENSSL_ROOT_DIR", root);
+          }
+          '''
+
+          new = '''    if let Some(root) = &openssl_paths.root {
+              command.env("OPENSSL_ROOT_DIR", root);
+
+              for (env_name, file_name) in [
+                  ("OPENSSL_CRYPTO_LIBRARY", "libcrypto.a"),
+                  ("OPENSSL_SSL_LIBRARY", "libssl.a"),
+              ] {
+                  if env::var_os(env_name).is_none() {
+                      match find_library_file(root, file_name, 0) {
+                          Some(library) => {
+                              println!(
+                                  "cargo:warning=Using {}={}",
+                                  env_name,
+                                  library.display()
+                              );
+                              command.env(env_name, library);
+                          }
+                          None => {
+                              println!(
+                                  "cargo:warning=Could not find {} under {}",
+                                  file_name,
+                                  root.display()
+                              );
+                          }
+                      }
+                  }
+              }
+          }
+          '''
+
+          if source.count(function_anchor) != 1:
+              raise SystemExit("STOP: build_picoquic function anchor did not match exactly once.")
+
+          if source.count(old) != 1:
+              raise SystemExit("STOP: OPENSSL_ROOT_DIR block did not match exactly once.")
+
+          if "fn find_library_file(" in source:
+              raise SystemExit("STOP: Library discovery helper already exists; inspect source first.")
+
+          source = source.replace(function_anchor, helper + function_anchor, 1)
+          source = source.replace(old, new, 1)
+          path.write_text(source)
+          print("Patched Picoquic to locate and pass libcrypto.a and libssl.a.")
+          PY_PICOQUIC
+
           cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
       - name: Configure Android linker

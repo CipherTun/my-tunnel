@@ -119,7 +119,7 @@ class MainActivity : FlutterActivity() {
                                 putExtra(XrayVpnService.EXTRA_CONFIG, config)
                                 putExtra(XrayVpnService.EXTRA_REMARK, call.argument<String>("remark") ?: "XRay Vpn")
                                 putExtra(XrayVpnService.EXTRA_PROXY_ONLY, call.argument<Boolean>("proxyOnly") ?: false)
-                                putExtra(XrayVpnService.EXTRA_DISALLOWED_APPS, call.argument<ArrayList<String>>("disallowedApps") ?: arrayListOf())
+                                putExtra(XrayVpnService.EXTRA_DISALLOWED_APPS, call.argument<ArrayList<String>>("disallowedApps") ?: arrayListOf<String>())
                                 putExtra(XrayVpnService.EXTRA_BYPASS_LAN, call.argument<Boolean>("bypassLan") ?: false)
                             }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)

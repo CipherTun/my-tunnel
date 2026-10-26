@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.IpPrefix
 import android.net.VpnService
+import java.net.InetAddress
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.Process
@@ -107,7 +108,12 @@ class XrayVpnService : VpnService() {
                     }
                     if (bypassLan && Build.VERSION.SDK_INT >= 33) {
                         for (cidr in listOf("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10")) {
-                            try { builder.excludeRoute(IpPrefix(cidr)) } catch (_: Exception) { }
+                            try { builder.excludeRoute(
+                                IpPrefix(
+                                    InetAddress.getByName(cidr.substringBefore('/')),
+                                    cidr.substringAfter('/').toInt()
+                                )
+                            ) } catch (_: Exception) { }
                         }
                     }
                     tun = builder.establish() ?: error("Android could not establish the VPN TUN. Check VPN permission.")

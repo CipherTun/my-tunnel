@@ -53,7 +53,7 @@ jobs:
       - run: flutter test
 
       - name: Build split release APKs (one APK per ABI)
-        run: flutter build apk --release --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x86,android-x64
+        run: flutter build apk --release --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x64
       - name: Verify each release APK and native engine payloads
         shell: bash
         run: |
@@ -62,7 +62,6 @@ jobs:
           declare -A expected=(
             [app-armeabi-v7a-release.apk]=armeabi-v7a
             [app-arm64-v8a-release.apk]=arm64-v8a
-            [app-x86-release.apk]=x86
             [app-x86_64-release.apk]=x86_64
           )
           for apk in "${!expected[@]}"; do
@@ -72,10 +71,10 @@ jobs:
             echo "Verified APK exists: $apk ($abi)"
           done
           aar_entries="$(unzip -Z1 android/app/libs/libXray.aar)"
-          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+          for abi in armeabi-v7a arm64-v8a x86_64; do
             printf '%s\n' "$aar_entries" | grep -q "^jni/$abi/" || { echo "ERROR: LibXray AAR missing native ABI $abi"; exit 1; }
           done
-          echo "Verified LibXray AAR and all four split APKs; DNSTT and Slipstream are temporarily excluded."
+          echo "Verified LibXray AAR and all three split APKs; DNSTT and Slipstream are temporarily excluded."
       - uses: actions/upload-artifact@v4
         with:
           name: xray-vpn-armeabi-v7a-apk
@@ -90,19 +89,13 @@ jobs:
           retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
-          name: xray-vpn-x86-apk
-          path: xray-vpn-x86.apk
-          if-no-files-found: error
-          retention-days: 14
-      - uses: actions/upload-artifact@v4
-        with:
           name: xray-vpn-x86_64-apk
           path: xray-vpn-x86_64.apk
           if-no-files-found: error
           retention-days: 14
 
       - name: Build debug split APKs
-        run: flutter build apk --debug --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x86,android-x64
+        run: flutter build apk --debug --split-per-abi --no-shrink --target-platform android-arm,android-arm64,android-x64
       - uses: actions/upload-artifact@v4
         with:
           name: xray-vpn-debug-split-apks

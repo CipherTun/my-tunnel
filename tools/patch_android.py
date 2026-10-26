@@ -166,16 +166,6 @@ for path in files:
     with open(path, "w", encoding="utf-8") as f:
         f.write(t)
 
-# ------------------------------------------------- gradle.properties / JitPack
-# Keep native libraries extractable: DNSTT and Slipstream are executable payloads in jniLibs.
-gp = "android/gradle.properties"
-if os.path.exists(gp):
-    with open(gp, encoding="utf-8") as f:
-        g = f.read()
-    if "android.bundle.enableUncompressedNativeLibs" not in g:
-        with open(gp, "a", encoding="utf-8") as f:
-            f.write(("" if g.endswith("\n") else "\n") + "android.bundle.enableUncompressedNativeLibs=false\n")
-
 # openvpn_flutter downloads its engine from JitPack. The plugin adds the repository itself, which
 # fails only when settings.gradle(.kts) uses dependencyResolutionManagement with FAIL_ON_PROJECT_REPOS.
 for sg in glob.glob("android/settings.gradle*"):

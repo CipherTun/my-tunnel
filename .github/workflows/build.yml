@@ -1,0 +1,104 @@
+name: Clean-room XRay Vpn Android build
+
+on:
+  push:
+    branches: ["main", "dev", "test/**", "fix/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout application source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Checkout official libXray source
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/libXray
+          ref: v26.10.21
+          path: .build/libXray
+
+      - name: Set up Go required by pinned libXray
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: .build/libXray/go.mod
+          cache: true
+          cache-dependency-path: .build/libXray/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.0"
+          channel: stable
+          cache: true
+
+      - name: Generate Android platform shell without touching app source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .build/flutter-shell
+          cd .build/flutter-shell
+          flutter create --platforms=android --org xyz.xray --project-name vpn --android-language kotlin .
+          cd "$GITHUB_WORKSPACE"
+          cp -a .build/flutter-shell/android ./android
+
+      - name: Build official libXray Android AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .build/libXray
+          python3 build/main.py android
+          test -s libXray.aar
+          mkdir -p "$GITHUB_WORKSPACE/android/app/libs"
+          cp libXray.aar "$GITHUB_WORKSPACE/android/app/libs/LibXray.aar"
+          sha256sum "$GITHUB_WORKSPACE/android/app/libs/LibXray.aar"
+
+      - name: Apply clean-room Android service integration
+        run: python3 tools/configure_android.py
+
+      - name: Resolve Dart packages
+        run: flutter pub get
+
+      - name: Static analysis
+        run: flutter analyze
+
+      - name: Unit tests
+        run: flutter test
+
+      - name: Build debug APK
+        run: flutter build apk --debug --no-shrink
+
+      - name: Build split release APKs
+        run: flutter build apk --release --no-shrink --split-per-abi --target-platform android-arm,android-arm64,android-x86,android-x64
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-clean-room-debug
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload release APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-vpn-clean-room-release-split
+          path: build/app/outputs/flutter-apk/app-*-release.apk
+          if-no-files-found: error

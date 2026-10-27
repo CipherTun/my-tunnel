@@ -1,0 +1,19 @@
+name: xray_vpn
+description: Clean-room Flutter VPN client using official libXray and DartSSH2.
+publish_to: none
+version: 1.0.0+1
+environment:
+  sdk: '>=3.9.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  dartssh2: ^4.1.0
+  crypto: ^3.0.6
+  flutter_secure_storage: ^9.2.4
+  qr_flutter: ^4.1.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+flutter:
+  uses-material-design: true

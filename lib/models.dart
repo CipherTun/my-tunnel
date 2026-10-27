@@ -92,6 +92,8 @@ class SubscriptionSource {
 }
 
 class AppPreferences {
+  AppPreferences();
+
   String theme = 'system';
   int accent = 0xFF147D76;
   bool autoReconnect = true;

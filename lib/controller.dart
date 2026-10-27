@@ -313,6 +313,7 @@ class VpnController extends ChangeNotifier {
     uploadBytes = downloadBytes = uploadSpeed = downloadSpeed = 0;
     notifyListeners();
     log('Starting ${profile.kind.label}: ${profile.name}');
+    var nativeStarted = false;
     try {
       String config;
       if (profile.kind == ProfileKind.ssh) {

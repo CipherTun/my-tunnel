@@ -9,6 +9,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'controller.dart';
 import 'models.dart';
 import 'payload_engine.dart';
+import 'ssh_engine.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -195,7 +196,23 @@ class _ServersPageState extends State<ServersPage> {
       appBar: AppBar(title: const Text('Servers'), backgroundColor: Colors.transparent, actions: [IconButton(tooltip: 'Import', onPressed: () => _importDialog(context, c), icon: const Icon(Icons.content_paste)), IconButton(tooltip: 'Backup', onPressed: () => _backupDialog(context, c), icon: const Icon(Icons.backup_outlined))]),
       body: Column(children: [
         Padding(padding: const EdgeInsets.fromLTRB(16, 4, 16, 10), child: TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'Search profiles'), onChanged: (v) => setState(() => query = v))),
-        SingleChildScrollView(scrollDirection: Axis.horizontal, padding: const EdgeInsets.symmetric(horizontal: 16), child: Row(children: [for (final label in ['All', 'SSH Tunnel', 'Xray', 'Proxy Chain', 'Failover Group']) Padding(padding: const EdgeInsets.only(right: 8), child: ChoiceChip(label: Text(label), selected: filter == label, onSelected: (_) => setState(() => filter = label))])),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            children: [
+              for (final label in ['All', 'SSH Tunnel', 'Xray', 'Proxy Chain', 'Failover Group'])
+                Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: ChoiceChip(
+                    label: Text(label),
+                    selected: filter == label,
+                    onSelected: (_) => setState(() => filter = label),
+                  ),
+                ),
+            ],
+          ),
+        ),
         Expanded(child: list.isEmpty ? Center(child: Padding(padding: const EdgeInsets.all(28), child: Column(mainAxisSize: MainAxisSize.min, children: [Icon(Icons.dns_outlined, size: 54, color: Theme.of(context).colorScheme.primary), const SizedBox(height: 12), Text(c.profiles.isEmpty ? 'No servers yet' : 'No matching profiles', style: Theme.of(context).textTheme.titleMedium), const SizedBox(height: 6), const Text('Add an SSH server or import an Xray share link / JSON.', textAlign: TextAlign.center), const SizedBox(height: 16), FilledButton.icon(onPressed: () => _addDialog(context, c), icon: const Icon(Icons.add), label: const Text('Add server'))]))) : ListView.separated(padding: const EdgeInsets.all(16), itemCount: list.length, separatorBuilder: (_, __) => const SizedBox(height: 8), itemBuilder: (context, i) {
           final p = list[i];
           final selected = p.id == c.selectedProfileId;

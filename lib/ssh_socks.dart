@@ -105,7 +105,26 @@ class SshSocksServer {
           socket.add(const <int>[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
           return;
         }
-        final relay = _UdpGatewayRelay(client: client, gatewayPort: udpGatewayPort, log: log, bindAddress: shareProxy ? InternetAddress.anyIPv4 : InternetAddress.loopbackIPv4, advertisedAddress: socket.localAddress);
+        var advertisedAddress = InternetAddress.loopbackIPv4;
+        if (shareProxy) {
+          final interfaces = await NetworkInterface.list(
+            type: InternetAddressType.IPv4,
+            includeLoopback: false,
+          );
+          for (final interface in interfaces) {
+            if (interface.addresses.isNotEmpty) {
+              advertisedAddress = interface.addresses.first;
+              break;
+            }
+          }
+        }
+        final relay = _UdpGatewayRelay(
+          client: client,
+          gatewayPort: udpGatewayPort,
+          log: log,
+          bindAddress: shareProxy ? InternetAddress.anyIPv4 : InternetAddress.loopbackIPv4,
+          advertisedAddress: advertisedAddress,
+        );
         _relays.add(relay);
         try {
           final endpoint = await relay.start();

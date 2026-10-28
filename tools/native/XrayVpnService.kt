@@ -42,7 +42,7 @@ class XrayVpnService : VpnService() {
     private var lastMetricAt = 0L
     @Volatile private var protectSockets = true
 
-    private val dialerController = object : DialerController, ListenerController {
+    private val dialerController = object : DialerController {
         override fun protectFd(fd: Long): Boolean {
             if (!protectSockets) return true
             return try { protect(fd.toInt()) } catch (e: Exception) { VpnRuntime.log("protect(fd) failed: ${e.message}"); false }

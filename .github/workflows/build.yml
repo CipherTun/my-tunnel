@@ -88,14 +88,14 @@ jobs:
           updated = False
           for i, line in enumerate(lines):
               if line.startswith("distributionUrl="):
-                  lines[i] = r"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.1.0-bin.zip"
+                  lines[i] = r"distributionUrl=https\://services.gradle.org/distributions/gradle-9.1.0-bin.zip"
                   updated = True
                   break
 
           if not updated:
               raise SystemExit("Could not find distributionUrl in Gradle wrapper")
 
-          wrapper.write_text("\\n".join(lines) + "\\n")
+          wrapper.write_text("\n".join(lines) + "\n")
 
           props = Path("android/gradle.properties")
           existing = props.read_text().splitlines() if props.exists() else []
@@ -107,7 +107,7 @@ jobs:
               existing = [line for line in existing if not line.startswith(key + "=")]
               existing.append(f"{key}={value}")
 
-          props.write_text("\\n".join(existing) + "\\n")
+          props.write_text("\n".join(existing) + "\n")
           print("Gradle wrapper set to 9.1.0")
           print("Legacy Android DSL and Kotlin compatibility flags set")
           PYTHON

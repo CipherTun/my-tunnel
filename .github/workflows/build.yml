@@ -121,22 +121,12 @@ jobs:
       - name: Unit tests
         run: flutter test
 
-      - name: Build debug APK
-        run: flutter build apk --debug --no-shrink
+      - name: Build split debug APKs
+        run: flutter build apk --debug --no-shrink --split-per-abi --target-platform android-arm,android-arm64,android-x64
 
-      - name: Build split release APKs
-        run: flutter build apk --release --no-shrink --split-per-abi --target-platform android-arm,android-arm64,android-x86,android-x64
-
-      - name: Upload debug APK
+      - name: Upload split debug APKs
         uses: actions/upload-artifact@v4
         with:
-          name: xray-vpn-clean-room-debug
-          path: build/app/outputs/flutter-apk/app-debug.apk
-          if-no-files-found: error
-
-      - name: Upload release APKs
-        uses: actions/upload-artifact@v4
-        with:
-          name: xray-vpn-clean-room-release-split
-          path: build/app/outputs/flutter-apk/app-*-release.apk
+          name: xray-vpn-clean-room-debug-split
+          path: build/app/outputs/flutter-apk/app-*-debug.apk
           if-no-files-found: error

@@ -73,6 +73,45 @@ jobs:
       - name: Apply clean-room Android service integration
         run: python3 tools/configure_android.py
 
+      - name: Align Gradle with Flutter Android compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          wrapper = Path("android/gradle/wrapper/gradle-wrapper.properties")
+          if not wrapper.is_file():
+              raise SystemExit(f"Missing generated wrapper: {wrapper}")
+
+          lines = wrapper.read_text().splitlines()
+          updated = False
+          for i, line in enumerate(lines):
+              if line.startswith("distributionUrl="):
+                  lines[i] = r"distributionUrl=https\\://services.gradle.org/distributions/gradle-9.1.0-bin.zip"
+                  updated = True
+                  break
+
+          if not updated:
+              raise SystemExit("Could not find distributionUrl in Gradle wrapper")
+
+          wrapper.write_text("\\n".join(lines) + "\\n")
+
+          props = Path("android/gradle.properties")
+          existing = props.read_text().splitlines() if props.exists() else []
+          settings = {
+              "android.newDsl": "false",
+              "android.builtInKotlin": "false",
+          }
+          for key, value in settings.items():
+              existing = [line for line in existing if not line.startswith(key + "=")]
+              existing.append(f"{key}={value}")
+
+          props.write_text("\\n".join(existing) + "\\n")
+          print("Gradle wrapper set to 9.1.0")
+          print("Legacy Android DSL and Kotlin compatibility flags set")
+          PYTHON
+
       - name: Resolve Dart packages
         run: flutter pub get
 
